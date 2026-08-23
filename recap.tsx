@@ -8,18 +8,33 @@
  * Tool suppression is proven by probe (see .scratch/039-tui-session-recap/probe/):
  * explicit `false` for every id from client.tool.ids() kills core tools, but MCP
  * tools leak past it — `"*": false` covers those.
+ *
+ * Recap Model comes from configuration (tuple options in tui.json) and resolves
+ * by chain, first successfully resolved wins: plugin `model` option →
+ * `small_model` from config → model of the last assistant message. Every
+ * candidate is validated against api.state.provider BEFORE the prompt call; an
+ * invalid or unknown value gets one error toast per failing source per process,
+ * then the next chain level is tried. Parsing lives in ./recap-model.ts — pure,
+ * unit-tested away from the TUI.
  */
 /** @jsxImportSource @opentui/solid */
 import { createSignal, Show } from "solid-js"
 import { SyntaxStyle, TextAttributes } from "@opentui/core"
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import {
+  type ModelRef,
+  type ModelSource,
+  isKnownModel,
+  parseModelRef,
+  parseRecapOptions,
+  sessionModelRef,
+  unwrapMessage,
+} from "./recap-model.ts"
 
 const RECAP_TITLE = "Recap"
 const COLLAPSE_KEY = "supercode.recap.collapsed"
 // shortcut: fixed tail window instead of the budgeted Digest (ticket 03)
 const TAIL_MESSAGES = 20
-
-type ModelRef = { providerID: string; modelID: string }
 
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message
@@ -27,36 +42,65 @@ function errorMessage(err: unknown): string {
   return data?.message ?? String(err)
 }
 
-// Strictly by the FIRST slash: gonka-proxy/deepseek-ai/deepseek-v4-flash-0731
-// has two slashes and the modelID keeps the second segment.
-function parseModelRef(value: unknown): ModelRef | undefined {
-  if (typeof value !== "string") return undefined
-  const cut = value.indexOf("/")
-  if (cut <= 0 || cut === value.length - 1) return undefined
-  return { providerID: value.slice(0, cut), modelID: value.slice(cut + 1) }
-}
+// Recap Model chain, first successfully resolved candidate wins:
+// plugin `model` option (tui.json) -> config.small_model -> model of the
+// session's last assistant message. Every parsed candidate is validated
+// against api.state.provider before it can win; a failing source gets ONE
+// error toast per process (keyed by source, not per click) and the next
+// level is tried. With nothing resolved the prompt goes out without a
+// `model` field and the server applies its default.
+function createModelResolver(api: TuiPluginApi, optionModel: string | undefined) {
+  // Once-per-process-per-source suppression lives in this closure: one
+  // registered instance per file is the documented setup.
+  const toastedSources = new Set<ModelSource>()
 
-// Recap Model, short chain (full chain with options + validation is ticket 02):
-// config.small_model -> model of the session's last assistant message -> none.
-function resolveRecapModel(api: TuiPluginApi, sessionID: string): ModelRef | undefined {
-  const fromConfig = parseModelRef(api.state.config.small_model)
-  if (fromConfig) return fromConfig
-  const messages = api.state.session.messages(sessionID)
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const info = messageInfo(messages[i])
-    if (info.role !== "assistant") continue
-    const providerID = info.providerID
-    const modelID = info.modelID
-    if (typeof providerID === "string" && providerID && typeof modelID === "string" && modelID) {
-      return { providerID, modelID }
-    }
+  // Read live at each call: the provider list populates after TUI startup and
+  // may be replaced wholesale — an init-time snapshot could stay empty forever.
+  const validate = (ref: ModelRef): boolean => {
+    const providers = api.state.provider
+    // Empty list means TUI state has not loaded yet — validating then would
+    // false-fail every level, so candidates that at least PARSE are trusted.
+    return !providers.length || isKnownModel(ref, providers)
   }
-  return undefined
+
+  const toastInvalid = (source: ModelSource, raw: string) => {
+    if (toastedSources.has(source)) return
+    toastedSources.add(source)
+    api.ui.toast({
+      variant: "error",
+      title: RECAP_TITLE,
+      message: `Recap model "${raw}" from ${source} is invalid or unknown — falling back`,
+    })
+  }
+
+  // A level is skipped silently when unset; only a PRESENT bad value toasts.
+  const fromConfigValue = (raw: string | undefined, source: ModelSource): ModelRef | undefined => {
+    if (raw === undefined) return undefined
+    const ref = parseModelRef(raw)
+    if (!ref || !validate(ref)) {
+      toastInvalid(source, raw)
+      return undefined
+    }
+    return ref
+  }
+
+  return (sessionID: string): ModelRef | undefined => {
+    const configured =
+      fromConfigValue(optionModel, "tui.json") ??
+      fromConfigValue(api.state.config.small_model, "small_model")
+    if (configured) return configured
+    const fromSession = sessionModelRef(api.state.session.messages(sessionID))
+    if (!fromSession) return undefined
+    if (!validate(fromSession)) {
+      toastInvalid("session", `${fromSession.providerID}/${fromSession.modelID}`)
+      return undefined
+    }
+    return fromSession
+  }
 }
 
 function messageInfo(message: unknown): Record<string, unknown> {
-  const m = message as { info?: Record<string, unknown> }
-  return m.info ?? (message as Record<string, unknown>)
+  return unwrapMessage(message) ?? {}
 }
 
 function messageParts(api: TuiPluginApi, message: unknown): ReadonlyArray<Record<string, unknown>> {
@@ -155,8 +199,24 @@ function View(props: { api: TuiPluginApi; session_id: string; onRecap: () => voi
   )
 }
 
-const tui: TuiPlugin = async (api) => {
+const tui: TuiPlugin = async (api, rawOptions) => {
   const { client } = api
+
+  const toast = (variant: "error" | "warning", message: string) =>
+    api.ui.toast({ variant, title: RECAP_TITLE, message })
+
+  // Tuple options from tui.json: recognized keys typed here; unknown keys are
+  // ignored silently; a recognized key of the wrong type gets one toast and its
+  // default. No tui.json at all is a normal mode — all defaults.
+  // stale_after/budget/timeout_ms are held for tickets 03/04 (their consumers).
+  const recapOptions = parseRecapOptions(rawOptions)
+  if (recapOptions.badKeys.length) {
+    toast(
+      "warning",
+      `Ignoring option${recapOptions.badKeys.length > 1 ? "s" : ""} of wrong type: ${recapOptions.badKeys.join(", ")} — using defaults`,
+    )
+  }
+  const resolveRecapModel = createModelResolver(api, recapOptions.model)
 
   // Fetched ONCE at init and cached; core ids go into `tools` all-false.
   // Probe finding: MCP tools are NOT in this list and need the "*" entry.
@@ -184,7 +244,7 @@ const tui: TuiPlugin = async (api) => {
 
       // One synchronous call; the answer carries ready parts — no session.idle,
       // no re-fetch, no prompt sniffing.
-      const model = resolveRecapModel(api, sessionID)
+      const model = resolveRecapModel(sessionID)
       const response = await client.session.prompt({
         sessionID: recapSessionID,
         ...(model ? { model } : {}),
@@ -212,17 +272,13 @@ const tui: TuiPlugin = async (api) => {
         .trim()
       recapSignal(sessionID)[1](markdown || "_No Recap generated._")
     } catch (err) {
-      api.ui.toast({ variant: "error", title: RECAP_TITLE, message: `Recap failed: ${errorMessage(err)}` })
+      toast("error", `Recap failed: ${errorMessage(err)}`)
     } finally {
       if (recapSessionID) {
         try {
           await client.session.delete({ sessionID: recapSessionID })
         } catch (err) {
-          api.ui.toast({
-            variant: "error",
-            title: RECAP_TITLE,
-            message: `Failed to delete Recap Session ${recapSessionID}: ${errorMessage(err)}`,
-          })
+          toast("error", `Failed to delete Recap Session ${recapSessionID}: ${errorMessage(err)}`)
         }
       }
       setLoading(false)
