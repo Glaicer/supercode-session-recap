@@ -22,9 +22,19 @@
  * invalid or unknown value gets one error toast per failing source per process,
  * then the next chain level is tried. Parsing lives in ./recap-model.ts — pure,
  * unit-tested away from the TUI.
+ *
+ * Resilience (ticket 04): a click while a Recap runs returns the SAME promise
+ * instead of starting a second Recap Session; a run is raced against an
+ * AbortController linked to api.lifecycle.signal plus a timeout_ms timer that
+ * stops the Recap Session via session.abort before deletion; failures go to an
+ * error toast and never touch the previous Recap; per-session state lives in an
+ * LRU-bounded map, dropped on session.deleted and on dispose. Recap Staleness
+ * counts the session's OWN messages after a successful Recap (never
+ * session.status transitions — compaction, subagents and retries must not
+ * count) and marks the Recap stale without erasing it.
  */
 /** @jsxImportSource @opentui/solid */
-import { createSignal, Show } from "solid-js"
+import { createMemo, createSignal, Show } from "solid-js"
 import { SyntaxStyle, TextAttributes } from "@opentui/core"
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import {
@@ -37,21 +47,57 @@ import {
   unwrapMessage,
 } from "./recap-model.ts"
 import { buildRecapDigest, buildRecapRequest } from "./recap-digest.ts"
+import { countUserMessages, isRecapStale } from "./recap-staleness.ts"
+import {
+  createRecapRecord,
+  LruMap,
+  RECAP_SESSION_STATE_LIMIT,
+  type RecapSessionRecord,
+  type ValueSignal,
+} from "./recap-state.ts"
 
 const RECAP_TITLE = "Recap"
 const COLLAPSE_KEY = "supercode.recap.collapsed"
 
-// Per-session messageID of the last message covered by a SUCCESSFUL Recap:
-// the next Digest folds only what came after it, and the stored Recap itself
-// is fed back as the PREVIOUS RECAP context block. Failed attempts touch
-// neither — a failed Recap must never become the context of the next one.
-const digestAnchors = new Map<string, string>()
+// Per-session Recap state, LRU-bounded by session count. The anchor marks the
+// last message covered by a SUCCESSFUL Recap (next Digest folds only what came
+// after it); lastRecap is the stored Recap itself fed back as the PREVIOUS
+// RECAP context block. Failed attempts touch neither — a failed Recap must
+// never become the context of the next one.
+const sessionRecords = new LruMap<string, RecapSessionRecord>(RECAP_SESSION_STATE_LIMIT)
 
-// Real Recap Markdown per session — the ONLY source of the PREVIOUS RECAP
-// block. Placeholders shown in the sidebar ("_No Recap material yet._",
-// "_No Recap generated._", error text) live outside this map, so a failed or
-// empty attempt can never become the context of the next one.
-const realRecaps = new Map<string, string>()
+// In-flight guard keyed by sessionID: a second click returns THE SAME promise
+// instead of creating another Recap Session. The guard deliberately lives in
+// generateRecap, not in the component's loading() check.
+const inFlight = new Map<string, Promise<void>>()
+
+// AbortControllers of running Recaps — aborted by session.deleted for the
+// deleted session and by dispose for all. Self-cleaning: removed when the run settles.
+const inFlightControllers = new Map<string, AbortController>()
+
+function sessionRecord(sessionID: string): RecapSessionRecord {
+  let record = sessionRecords.get(sessionID)
+  if (!record) {
+    record = createRecapRecord()
+    sessionRecords.set(sessionID, record)
+  }
+  return record
+}
+
+function recapSignalOf(record: RecapSessionRecord): ValueSignal<string | null> {
+  record.recap ??= createSignal<string | null>(null) as ValueSignal<string | null>
+  return record.recap
+}
+
+function loadingSignalOf(record: RecapSessionRecord): ValueSignal<boolean> {
+  record.loading ??= createSignal<boolean>(false) as ValueSignal<boolean>
+  return record.loading
+}
+
+function baselineSignalOf(record: RecapSessionRecord): ValueSignal<number | null> {
+  record.baseline ??= createSignal<number | null>(null) as ValueSignal<number | null>
+  return record.baseline
+}
 
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message
@@ -141,27 +187,12 @@ function buildSyntaxStyle(api: TuiPluginApi): SyntaxStyle {
   })
 }
 
-const recapSignals = new Map<string, unknown>()
-const loadingSignals = new Map<string, unknown>()
-
-function lazySignal<Value>(map: Map<string, unknown>, sessionID: string, initial: Value) {
-  let s = map.get(sessionID) as ReturnType<typeof createSignal<Value>> | undefined
-  if (!s) {
-    s = createSignal(initial)
-    map.set(sessionID, s)
-  }
-  return s as [() => Value, (value: Value) => Value]
-}
-
-function recapSignal(sessionID: string) {
-  return lazySignal(recapSignals, sessionID, null as string | null)
-}
-
-function loadingSignal(sessionID: string) {
-  return lazySignal(loadingSignals, sessionID, false)
-}
-
-function View(props: { api: TuiPluginApi; session_id: string; onRecap: () => void }) {
+function View(props: {
+  api: TuiPluginApi
+  session_id: string
+  staleAfter: number
+  onRecap: () => void
+}) {
   const theme = () => props.api.theme.current
   // api.kv is a plain get/set store — keep a local signal for redraws and write through.
   const [collapsed, setCollapsed] = createSignal(props.api.kv.get(COLLAPSE_KEY, false))
@@ -170,8 +201,22 @@ function View(props: { api: TuiPluginApi; session_id: string; onRecap: () => voi
     setCollapsed(next)
     props.api.kv.set(COLLAPSE_KEY, next)
   }
-  const recap = () => recapSignal(props.session_id)[0]()
-  const loading = () => loadingSignal(props.session_id)[0]()
+  const record = () => sessionRecord(props.session_id)
+  const recap = () => recapSignalOf(record())[0]()
+  const loading = () => loadingSignalOf(record())[0]()
+
+  // Recap Staleness over reactive TUI state: own messages counted in a memo,
+  // compared with the snapshot taken when the last Recap succeeded. No event
+  // subscriptions; compaction/subagents/retries never move it.
+  const userCount = createMemo(() => countUserMessages(props.api.state.session.messages(props.session_id)))
+  const stale = createMemo(() => {
+    const baseline = baselineSignalOf(record())[0]()
+    return baseline !== null && isRecapStale(userCount(), baseline, props.staleAfter)
+  })
+  const messagesSinceRecap = () => {
+    const baseline = baselineSignalOf(record())[0]()
+    return baseline === null ? null : userCount() - baseline
+  }
   const syntaxStyle = () => buildSyntaxStyle(props.api)
 
   return (
@@ -189,7 +234,13 @@ function View(props: { api: TuiPluginApi; session_id: string; onRecap: () => voi
         >
           {loading() ? "Generating…" : "Recap"}
         </text>
-        <Show when={recap() !== null && !loading()}>
+        {/* Marked stale, not erased: an old Recap still orients. */}
+        <Show when={!loading() && recap() !== null && stale()}>
+          <text fg={theme().textMuted}>
+            {`stale — ${messagesSinceRecap()} messages since Recap (click to refresh)`}
+          </text>
+        </Show>
+        <Show when={!loading() && recap() !== null}>
           <markdown content={recap()!} syntaxStyle={syntaxStyle()} fg={theme().text} />
         </Show>
       </Show>
@@ -206,8 +257,6 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   // Tuple options from tui.json: recognized keys typed here; unknown keys are
   // ignored silently; a recognized key of the wrong type gets one toast and its
   // default. No tui.json at all is a normal mode — all defaults.
-  // budget feeds buildRecapDigest here; stale_after/timeout_ms are held for
-  // ticket 04 (their consumers).
   const recapOptions = parseRecapOptions(rawOptions)
   if (recapOptions.badKeys.length) {
     toast(
@@ -225,10 +274,35 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     return { ...Object.fromEntries(toolIds.map((id) => [id, false])), "*": false }
   }
 
-  async function generateRecap(sessionID: string) {
-    const [, setLoading] = loadingSignal(sessionID)
-    setLoading(true)
+  async function runRecap(sessionID: string): Promise<void> {
+    const record = sessionRecord(sessionID)
+    loadingSignalOf(record)[1](true)
     let recapSessionID: string | undefined
+    const controller = new AbortController()
+    inFlightControllers.set(sessionID, controller)
+    let timedOut = false
+
+    // Spec order on timeout/shutdown: the Recap Session is asked to stop, and
+    // deletion waits for that request to complete (enforced in the finally).
+    // Idempotent: one abort POST per run no matter who triggers it.
+    let stopRequest: Promise<unknown> | undefined
+    const stopRecapSession = (): Promise<void> => {
+      if (!recapSessionID) return Promise.resolve()
+      stopRequest ??= client.session.abort({ sessionID: recapSessionID }).catch(() => {
+        // deletion below reports its own failures; an abort error adds nothing
+      })
+      return stopRequest
+    }
+
+    // Linked to the plugin lifecycle: deactivation or TUI shutdown aborts the run.
+    const onLifecycleAbort = () => controller.abort()
+    api.lifecycle.signal.addEventListener("abort", onLifecycleAbort)
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+      void stopRecapSession()
+    }, recapOptions.timeout_ms)
+
     try {
       // Recap Digest from reactive TUI state: tool calls folded to one line
       // each, reasoning dropped, long text cut visibly. Window is incremental —
@@ -240,15 +314,15 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       }))
       const built = buildRecapDigest(entries, {
         budget: recapOptions.budget,
-        afterMessageID: digestAnchors.get(sessionID),
+        afterMessageID: record.anchor,
       })
       if (!built.digest) {
-        recapSignal(sessionID)[1]("_No Recap material yet._")
+        recapSignalOf(record)[1]("_No Recap material yet._")
         return
       }
       const request = buildRecapRequest({
         digest: built.digest,
-        previousRecap: realRecaps.get(sessionID),
+        previousRecap: record.lastRecap,
         truncated: built.truncated,
       })
 
@@ -258,9 +332,11 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       if (!recapSessionID) throw new Error("Failed to create Recap Session")
 
       // One synchronous call; the answer carries ready parts — no session.idle,
-      // no re-fetch, no prompt sniffing.
+      // no re-fetch, no prompt sniffing. Raced against the controller so a
+      // timeout or lifecycle shutdown ALWAYS releases the button even if the
+      // transport hangs past the server-side abort.
       const model = resolveRecapModel(sessionID)
-      const response = await client.session.prompt({
+      const prompt = client.session.prompt({
         sessionID: recapSessionID,
         ...(model ? { model } : {}),
         system:
@@ -268,6 +344,14 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         tools: suppressAllTools(),
         parts: [{ type: "text", text: request }],
       })
+      // The losing race branch may reject late — never let that become unhandled.
+      prompt.catch(() => {})
+      const response = await Promise.race([
+        prompt,
+        new Promise<never>((_, reject) =>
+          controller.signal.addEventListener("abort", () => reject(new Error("Recap aborted")), { once: true }),
+        ),
+      ])
 
       const markdown = (response.data?.parts ?? [])
         .filter((p) => p.type === "text")
@@ -277,31 +361,81 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       if (!markdown) {
         // Empty reply: neither the anchor nor PREVIOUS RECAP may advance, so
         // the next click retries the same window.
-        recapSignal(sessionID)[1]("_No Recap generated._")
+        recapSignalOf(record)[1]("_No Recap generated._")
         return
       }
-      if (built.lastIncludedID !== undefined) digestAnchors.set(sessionID, built.lastIncludedID)
-      realRecaps.set(sessionID, markdown)
-      recapSignal(sessionID)[1](markdown)
+      if (built.lastIncludedID !== undefined) record.anchor = built.lastIncludedID
+      record.lastRecap = markdown
+      // Staleness snapshot taken NOW, on success, over reactive TUI state;
+      // failures above never moved it. A stale Recap is marked, not erased.
+      baselineSignalOf(record)[1](countUserMessages(api.state.session.messages(sessionID)))
+      recapSignalOf(record)[1](markdown)
     } catch (err) {
-      toast("error", `Recap failed: ${errorMessage(err)}`)
+      // Shutdown is not a Recap failure: deactivation/TUI exit aborts silently.
+      if (!api.lifecycle.signal.aborted) {
+        toast(
+          "error",
+          timedOut
+            ? `Recap timed out after ${recapOptions.timeout_ms}ms`
+            : `Recap failed: ${errorMessage(err)}`,
+        )
+      }
     } finally {
+      clearTimeout(timer)
+      api.lifecycle.signal.removeEventListener("abort", onLifecycleAbort)
+      inFlightControllers.delete(sessionID)
       if (recapSessionID) {
+        // Abort-before-delete on every aborted path; no-op if already requested.
+        if (controller.signal.aborted) await stopRecapSession()
         try {
           await client.session.delete({ sessionID: recapSessionID })
         } catch (err) {
           toast("error", `Failed to delete Recap Session ${recapSessionID}: ${errorMessage(err)}`)
         }
       }
-      setLoading(false)
+      loadingSignalOf(record)[1](false)
     }
   }
+
+  // Re-entrancy guard: five rapid clicks hand back ONE promise → one Recap
+  // Session created and deleted. The component's loading() check is cosmetic.
+  function generateRecap(sessionID: string): Promise<void> {
+    const running = inFlight.get(sessionID)
+    if (running) return running
+    const run = runRecap(sessionID).finally(() => inFlight.delete(sessionID))
+    inFlight.set(sessionID, run)
+    return run
+  }
+
+  // Bug 5 of the reference fixed: per-session state does not grow forever.
+  const offSessionDeleted = api.event.on("session.deleted", (event) => {
+    const sessionID = event.properties.info.id
+    inFlightControllers.get(sessionID)?.abort()
+    inFlightControllers.delete(sessionID)
+    sessionRecords.delete(sessionID)
+  })
+  api.lifecycle.onDispose(offSessionDeleted)
+
+  // Deactivation / TUI shutdown (US 25): subscriptions released, runs aborted,
+  // all state dropped.
+  api.lifecycle.onDispose(() => {
+    for (const controller of inFlightControllers.values()) controller.abort()
+    inFlightControllers.clear()
+    sessionRecords.clear()
+  })
 
   api.slots.register({
     order: 250,
     slots: {
       sidebar_content(_ctx, props) {
-        return <View api={api} session_id={props.session_id} onRecap={() => generateRecap(props.session_id)} />
+        return (
+          <View
+            api={api}
+            session_id={props.session_id}
+            staleAfter={recapOptions.stale_after}
+            onRecap={() => generateRecap(props.session_id)}
+          />
+        )
       },
     },
   })
