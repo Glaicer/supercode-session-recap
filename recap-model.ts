@@ -8,9 +8,11 @@ export type ModelRef = { providerID: string; modelID: string }
 /** Where a failed candidate came from — named verbatim in the error toast. */
 export type ModelSource = "tui.json" | "small_model" | "session"
 
+export const DIGEST_DEFAULT_BUDGET = 12000
+
 export const RECAP_OPTION_DEFAULTS = {
   stale_after: 3,
-  budget: 12000,
+  budget: DIGEST_DEFAULT_BUDGET,
   timeout_ms: 60000,
 } as const
 

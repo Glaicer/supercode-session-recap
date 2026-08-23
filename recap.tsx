@@ -1,9 +1,15 @@
 /**
- * supercode.recap — TUI sidebar section that summarizes the current session.
+ * supercode.recap — TUI sidebar section showing a Recap of the current session.
  *
- * Click `Recap` → the plugin folds the session tail into a transcript, runs ONE
- * synchronous `session.prompt` against a throwaway child session with every tool
- * disabled, renders the Markdown reply in the sidebar and deletes the session.
+ * Click `Recap` → the plugin folds the session into a Recap Digest (one line
+ * per tool call, reasoning dropped, long text cut visibly, budgeted with
+ * overflow dropped from the head), runs ONE synchronous `session.prompt`
+ * against a throwaway child session with every tool disabled, renders the
+ * Markdown reply in the sidebar and deletes the session.
+ *
+ * The window is incremental: a successful Recap stores the messageID it
+ * covered, so the next Digest folds only messages after it and feeds the
+ * stored Recap back as the PREVIOUS RECAP context block.
  *
  * Tool suppression is proven by probe (see .scratch/039-tui-session-recap/probe/):
  * explicit `false` for every id from client.tool.ids() kills core tools, but MCP
@@ -30,11 +36,22 @@ import {
   sessionModelRef,
   unwrapMessage,
 } from "./recap-model.ts"
+import { buildRecapDigest, buildRecapRequest } from "./recap-digest.ts"
 
 const RECAP_TITLE = "Recap"
 const COLLAPSE_KEY = "supercode.recap.collapsed"
-// shortcut: fixed tail window instead of the budgeted Digest (ticket 03)
-const TAIL_MESSAGES = 20
+
+// Per-session messageID of the last message covered by a SUCCESSFUL Recap:
+// the next Digest folds only what came after it, and the stored Recap itself
+// is fed back as the PREVIOUS RECAP context block. Failed attempts touch
+// neither — a failed Recap must never become the context of the next one.
+const digestAnchors = new Map<string, string>()
+
+// Real Recap Markdown per session — the ONLY source of the PREVIOUS RECAP
+// block. Placeholders shown in the sidebar ("_No Recap material yet._",
+// "_No Recap generated._", error text) live outside this map, so a failed or
+// empty attempt can never become the context of the next one.
+const realRecaps = new Map<string, string>()
 
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message
@@ -107,25 +124,6 @@ function messageParts(api: TuiPluginApi, message: unknown): ReadonlyArray<Record
   const m = message as { parts?: ReadonlyArray<Record<string, unknown>> }
   if (Array.isArray(m.parts)) return m.parts
   return api.state.part(String((message as { id?: string }).id)) as ReadonlyArray<Record<string, unknown>>
-}
-
-// Transcript: tail of the session, text parts only — reasoning and tool output
-// stay out (rich Digest is ticket 03). Read from reactive TUI state, not HTTP.
-function buildTranscript(api: TuiPluginApi, sessionID: string): string {
-  const rows: string[] = []
-  for (const message of api.state.session.messages(sessionID).slice(-TAIL_MESSAGES)) {
-    const info = messageInfo(message)
-    const role = info.role === "user" ? "user" : info.role === "assistant" ? "assistant" : null
-    if (!role) continue
-    const text = messageParts(api, message)
-      .filter((p) => p.type === "text" && !(p as { ignored?: boolean }).ignored)
-      .map((p) => String((p as { text?: string }).text ?? "").trim())
-      .filter(Boolean)
-      .join(" ")
-      .trim()
-    if (text) rows.push(`${role}: ${text}`)
-  }
-  return rows.join("\n\n")
 }
 
 function buildSyntaxStyle(api: TuiPluginApi): SyntaxStyle {
@@ -208,7 +206,8 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   // Tuple options from tui.json: recognized keys typed here; unknown keys are
   // ignored silently; a recognized key of the wrong type gets one toast and its
   // default. No tui.json at all is a normal mode — all defaults.
-  // stale_after/budget/timeout_ms are held for tickets 03/04 (their consumers).
+  // budget feeds buildRecapDigest here; stale_after/timeout_ms are held for
+  // ticket 04 (their consumers).
   const recapOptions = parseRecapOptions(rawOptions)
   if (recapOptions.badKeys.length) {
     toast(
@@ -231,11 +230,27 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     setLoading(true)
     let recapSessionID: string | undefined
     try {
-      const transcript = buildTranscript(api, sessionID)
-      if (!transcript) {
-        recapSignal(sessionID)[1]("_Nothing to summarize yet._")
+      // Recap Digest from reactive TUI state: tool calls folded to one line
+      // each, reasoning dropped, long text cut visibly. Window is incremental —
+      // messages after the last successful Recap's anchor — and bounded by the
+      // configured budget with overflow dropped from the head.
+      const entries = api.state.session.messages(sessionID).map((message) => ({
+        info: messageInfo(message),
+        parts: messageParts(api, message),
+      }))
+      const built = buildRecapDigest(entries, {
+        budget: recapOptions.budget,
+        afterMessageID: digestAnchors.get(sessionID),
+      })
+      if (!built.digest) {
+        recapSignal(sessionID)[1]("_No Recap material yet._")
         return
       }
+      const request = buildRecapRequest({
+        digest: built.digest,
+        previousRecap: realRecaps.get(sessionID),
+        truncated: built.truncated,
+      })
 
       // Recap Session: throwaway child so it stays out of the top-level list.
       const created = await client.session.create({ parentID: sessionID, title: "recap" })
@@ -251,18 +266,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         system:
           "You are a summarization assistant. Output only Markdown — no tools, no files, no questions.",
         tools: suppressAllTools(),
-        parts: [
-          {
-            type: "text",
-            text:
-              "Summarize the coding session below. Answer with exactly three sections, in this order:\n" +
-              "**Working on:** one sentence — what is being built or explored right now\n" +
-              "**Done:** up to 3 short bullets of what is already finished (skip if nothing yet)\n" +
-              "**Next:** one bullet — the immediate next step\n" +
-              "No intro, no outro, no other sections.\n\n" +
-              `SESSION TRANSCRIPT:\n${transcript}`,
-          },
-        ],
+        parts: [{ type: "text", text: request }],
       })
 
       const markdown = (response.data?.parts ?? [])
@@ -270,7 +274,15 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         .map((p) => (p as { text?: string }).text ?? "")
         .join("")
         .trim()
-      recapSignal(sessionID)[1](markdown || "_No Recap generated._")
+      if (!markdown) {
+        // Empty reply: neither the anchor nor PREVIOUS RECAP may advance, so
+        // the next click retries the same window.
+        recapSignal(sessionID)[1]("_No Recap generated._")
+        return
+      }
+      if (built.lastIncludedID !== undefined) digestAnchors.set(sessionID, built.lastIncludedID)
+      realRecaps.set(sessionID, markdown)
+      recapSignal(sessionID)[1](markdown)
     } catch (err) {
       toast("error", `Recap failed: ${errorMessage(err)}`)
     } finally {
