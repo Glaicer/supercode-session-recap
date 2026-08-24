@@ -6,7 +6,24 @@
 export type ModelRef = { providerID: string; modelID: string }
 
 /** Where a failed candidate came from — named verbatim in the error toast. */
-export type ModelSource = "tui.json" | "small_model" | "session"
+export type ModelSource = "runtime" | "tui.json" | "small_model" | "session"
+
+/** api.kv key holding the runtime-picked Recap Model (ticket 05). */
+export const RECAP_MODEL_KV_KEY = "recap.model"
+
+/** `provider/model-id` — the one string shape used at every chain level. */
+export function modelRefString(ref: ModelRef): string {
+  return `${ref.providerID}/${ref.modelID}`
+}
+
+/** One DialogSelect entry for the runtime picker (rendering is recap.tsx's job). */
+export type ModelPickOption = {
+  title: string
+  /** Raw `provider/model-id`, so a pick round-trips through api.kv verbatim. */
+  value: string
+  description?: string
+  category?: string
+}
 
 export const DIGEST_DEFAULT_BUDGET = 12000
 
@@ -107,4 +124,36 @@ export function isKnownModel(ref: ModelRef, providers: ReadonlyArray<unknown>): 
     const provider = p as { id?: unknown; models?: Record<string, unknown> } | null | undefined
     return provider?.id === ref.providerID && Boolean(provider.models?.[ref.modelID])
   })
+}
+
+// Flatten api.state.provider into grouped picker options: one entry per model,
+// DialogSelect's `category` carries the provider name so models render grouped
+// by provider. Provider and model order are kept as given; title prefers the
+// model's display name and falls back to the raw id. Junk entries and
+// providers without models are skipped — a picker must never throw.
+export function modelPickerOptions(providers: ReadonlyArray<unknown>): ModelPickOption[] {
+  const options: ModelPickOption[] = []
+  for (const entry of providers) {
+    const provider = entry as
+      | { id?: unknown; name?: unknown; models?: Record<string, unknown> }
+      | null
+      | undefined
+    if (!provider || typeof provider !== "object") continue
+    if (typeof provider.id !== "string" || !provider.id) continue
+    const models = provider.models
+    if (!models || typeof models !== "object") continue
+    const providerName = typeof provider.name === "string" && provider.name ? provider.name : provider.id
+    for (const [modelID, info] of Object.entries(models)) {
+      if (!modelID) continue
+      const model = info as { name?: unknown } | null | undefined
+      const title = model && typeof model.name === "string" && model.name ? model.name : modelID
+      options.push({
+        title,
+        value: modelRefString({ providerID: provider.id, modelID }),
+        description: providerName,
+        category: providerName,
+      })
+    }
+  }
+  return options
 }

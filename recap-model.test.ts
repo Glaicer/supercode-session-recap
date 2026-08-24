@@ -2,8 +2,11 @@ import assert from "node:assert/strict"
 import { describe, it } from "node:test"
 import {
   isKnownModel,
+  modelPickerOptions,
+  modelRefString,
   parseModelRef,
   parseRecapOptions,
+  RECAP_MODEL_KV_KEY,
   sessionModelRef,
 } from "./recap-model.ts"
 
@@ -144,5 +147,96 @@ describe("isKnownModel", () => {
   })
   it("false against an empty provider list", () => {
     assert.equal(isKnownModel({ providerID: "opencode", modelID: "nemotron" }, []), false)
+  })
+})
+
+describe("RECAP_MODEL_KV_KEY / modelRefString", () => {
+  it("kv key is exactly recap.model (spec wording)", () => {
+    assert.equal(RECAP_MODEL_KV_KEY, "recap.model")
+  })
+  it("round-trips through parseModelRef by the FIRST slash", () => {
+    const raw = modelRefString({ providerID: "gonka-proxy", modelID: "deepseek-ai/deepseek-v4-flash-0731" })
+    assert.equal(raw, "gonka-proxy/deepseek-ai/deepseek-v4-flash-0731")
+    assert.deepEqual(parseModelRef(raw), {
+      providerID: "gonka-proxy",
+      modelID: "deepseek-ai/deepseek-v4-flash-0731",
+    })
+  })
+})
+
+describe("modelPickerOptions", () => {
+  const providers = [
+    {
+      id: "opencode",
+      name: "OpenCode",
+      models: {
+        "nemotron-3.5-lightning-free": { id: "nemotron-3.5-lightning-free", name: "Nemotron 3.5 Lightning" },
+        "hy3-free": { id: "hy3-free", name: "" },
+      },
+    },
+    {
+      id: "gonka-proxy",
+      name: "Gonka Proxy",
+      models: { "deepseek-ai/deepseek-v4-flash-0731": { id: "x", name: "DeepSeek V4 Flash" } },
+    },
+    { id: "empty", name: "Empty Provider", models: {} },
+    { id: "no-models-field", name: "No Models" },
+    null,
+    "junk",
+  ]
+
+  it("flattens every known model into one option per entry, grouped by provider name", () => {
+    const options = modelPickerOptions(providers)
+    assert.deepEqual(options.map((o) => [o.category, o.title]), [
+      ["OpenCode", "Nemotron 3.5 Lightning"],
+      ["OpenCode", "hy3-free"],
+      ["Gonka Proxy", "DeepSeek V4 Flash"],
+    ])
+  })
+
+  it("values are raw provider/model-id strings that round-trip through parseModelRef", () => {
+    const options = modelPickerOptions(providers)
+    for (const option of options) {
+      const ref = parseModelRef(option.value)
+      assert.ok(ref, option.value)
+      const owner = providers.find(
+        (p) => p && typeof p === "object" && (p as { id?: string }).id === ref!.providerID,
+      )
+      assert.ok(owner, option.value)
+    }
+    assert.equal(options[0].value, "opencode/nemotron-3.5-lightning-free")
+    assert.equal(options[2].value, "gonka-proxy/deepseek-ai/deepseek-v4-flash-0731")
+  })
+
+  it("title prefers model.name and falls back to the raw modelID when name is missing or empty", () => {
+    const options = modelPickerOptions(providers)
+    assert.equal(options[0].title, "Nemotron 3.5 Lightning")
+    assert.equal(options[1].title, "hy3-free")
+  })
+
+  it("describes each option with its provider name", () => {
+    const options = modelPickerOptions(providers)
+    assert.equal(options[0].description, "OpenCode")
+    assert.equal(options[2].description, "Gonka Proxy")
+  })
+
+  it("skips providers without models without dying on junk entries", () => {
+    const options = modelPickerOptions(providers)
+    assert.equal(options.length, 3)
+    assert.equal(modelPickerOptions([]).length, 0)
+    assert.equal(modelPickerOptions([null, undefined, 42, "x"]).length, 0)
+  })
+
+  it("keeps provider order as given (api.state.provider order)", () => {
+    const flipped = [providers[1], providers[0]]
+    const options = modelPickerOptions(flipped)
+    assert.equal(options[0].category, "Gonka Proxy")
+  })
+
+  it("does not offer an empty model id that cannot pass model-ref validation", () => {
+    const options = modelPickerOptions([
+      { id: "provider", name: "Provider", models: { "": { name: "Broken" }, valid: {} } },
+    ])
+    assert.deepEqual(options.map((option) => option.value), ["provider/valid"])
   })
 })

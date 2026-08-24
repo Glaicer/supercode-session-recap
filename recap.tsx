@@ -15,13 +15,18 @@
  * explicit `false` for every id from client.tool.ids() kills core tools, but MCP
  * tools leak past it — `"*": false` covers those.
  *
- * Recap Model comes from configuration (tuple options in tui.json) and resolves
- * by chain, first successfully resolved wins: plugin `model` option →
- * `small_model` from config → model of the last assistant message. Every
- * candidate is validated against api.state.provider BEFORE the prompt call; an
- * invalid or unknown value gets one error toast per failing source per process,
- * then the next chain level is tried. Parsing lives in ./recap-model.ts — pure,
- * unit-tested away from the TUI.
+ * Recap Model comes from configuration (tuple options in tui.json) or a
+ * RUNTIME pick (ticket 05): a DialogSelect over api.state.provider, grouped by
+ * provider, writes the chosen `provider/model-id` string to api.kv under
+ * "recap.model", so it survives TUI restarts and overrides configuration;
+ * picking "Follow configuration" clears the key and the chain of ticket 02
+ * applies again on the very next click, no restart. The chain resolves by
+ * first successfully resolved candidate wins: runtime (api.kv) → plugin
+ * `model` option → `small_model` from config → model of the last assistant
+ * message. Every candidate is validated against api.state.provider BEFORE the
+ * prompt call; an invalid or unknown value gets one error toast per failing
+ * source per process, then the next chain level is tried. Parsing lives in
+ * ./recap-model.ts — pure, unit-tested away from the TUI.
  *
  * Resilience (ticket 04): a click while a Recap runs returns the SAME promise
  * instead of starting a second Recap Session; a run is raced against an
@@ -32,6 +37,10 @@
  * counts the session's OWN messages after a successful Recap (never
  * session.status transitions — compaction, subagents and retries must not
  * count) and marks the Recap stale without erasing it.
+ *
+ * The section header folds the whole section into one line (ticket 05); the
+ * collapsed flag lives in api.kv and survives restarts. The `Model:` line
+ * opens the runtime picker; it also shows what the chain would resolve to now.
  */
 /** @jsxImportSource @opentui/solid */
 import { createMemo, createSignal, Show } from "solid-js"
@@ -41,8 +50,11 @@ import {
   type ModelRef,
   type ModelSource,
   isKnownModel,
+  modelPickerOptions,
+  modelRefString,
   parseModelRef,
   parseRecapOptions,
+  RECAP_MODEL_KV_KEY,
   sessionModelRef,
   unwrapMessage,
 } from "./recap-model.ts"
@@ -58,6 +70,11 @@ import {
 
 const RECAP_TITLE = "Recap"
 const COLLAPSE_KEY = "supercode.recap.collapsed"
+
+// Runtime picker: first entry clears the runtime choice; the rest come from
+// modelPickerOptions(api.state.provider), grouped by provider via `category`.
+const PICK_RESET_VALUE = "__follow-configuration__"
+const PICK_RESET_TITLE = "Follow configuration"
 
 // Per-session Recap state, LRU-bounded by session count. The anchor marks the
 // last message covered by a SUCCESSFUL Recap (next Digest folds only what came
@@ -106,12 +123,20 @@ function errorMessage(err: unknown): string {
 }
 
 // Recap Model chain, first successfully resolved candidate wins:
-// plugin `model` option (tui.json) -> config.small_model -> model of the
-// session's last assistant message. Every parsed candidate is validated
-// against api.state.provider before it can win; a failing source gets ONE
-// error toast per process (keyed by source, not per click) and the next
-// level is tried. With nothing resolved the prompt goes out without a
-// `model` field and the server applies its default.
+// RUNTIME pick (api.kv "recap.model", ticket 05) -> plugin `model` option
+// (tui.json) -> config.small_model -> model of the session's last assistant
+// message. Every parsed candidate is validated against api.state.provider
+// before it can win; a failing source gets ONE error toast per process (keyed
+// by source, not per click) and the next level is tried. With nothing resolved
+// the prompt goes out without a `model` field and the server applies its default.
+
+// api.kv has no delete: null is our written "no runtime choice" marker and the
+// fallback for a never-set key, so both states read identically as unset.
+function runtimeModelRaw(api: TuiPluginApi): string | undefined {
+  const raw = api.kv.get<string | null>(RECAP_MODEL_KV_KEY, null)
+  return typeof raw === "string" && raw ? raw : undefined
+}
+
 function createModelResolver(api: TuiPluginApi, optionModel: string | undefined) {
   // Once-per-process-per-source suppression lives in this closure: one
   // registered instance per file is the documented setup.
@@ -137,25 +162,30 @@ function createModelResolver(api: TuiPluginApi, optionModel: string | undefined)
   }
 
   // A level is skipped silently when unset; only a PRESENT bad value toasts.
-  const fromConfigValue = (raw: string | undefined, source: ModelSource): ModelRef | undefined => {
+  const fromConfigValue = (
+    raw: string | undefined,
+    source: ModelSource,
+    notifyInvalid: boolean,
+  ): ModelRef | undefined => {
     if (raw === undefined) return undefined
     const ref = parseModelRef(raw)
     if (!ref || !validate(ref)) {
-      toastInvalid(source, raw)
+      if (notifyInvalid) toastInvalid(source, raw)
       return undefined
     }
     return ref
   }
 
-  return (sessionID: string): ModelRef | undefined => {
+  return (sessionID: string, notifyInvalid = true): ModelRef | undefined => {
     const configured =
-      fromConfigValue(optionModel, "tui.json") ??
-      fromConfigValue(api.state.config.small_model, "small_model")
+      fromConfigValue(runtimeModelRaw(api), "runtime", notifyInvalid) ??
+      fromConfigValue(optionModel, "tui.json", notifyInvalid) ??
+      fromConfigValue(api.state.config.small_model, "small_model", notifyInvalid)
     if (configured) return configured
     const fromSession = sessionModelRef(api.state.session.messages(sessionID))
     if (!fromSession) return undefined
     if (!validate(fromSession)) {
-      toastInvalid("session", `${fromSession.providerID}/${fromSession.modelID}`)
+      if (notifyInvalid) toastInvalid("session", `${fromSession.providerID}/${fromSession.modelID}`)
       return undefined
     }
     return fromSession
@@ -192,10 +222,13 @@ function View(props: {
   session_id: string
   staleAfter: number
   onRecap: () => void
+  /** What the chain would resolve to now — shown and handed to the picker as `current`. */
+  currentModelRaw: () => string | undefined
+  onPickModel: () => void
 }) {
   const theme = () => props.api.theme.current
   // api.kv is a plain get/set store — keep a local signal for redraws and write through.
-  const [collapsed, setCollapsed] = createSignal(props.api.kv.get(COLLAPSE_KEY, false))
+  const [collapsed, setCollapsed] = createSignal(props.api.kv.get(COLLAPSE_KEY, false) === true)
   const toggleCollapsed = () => {
     const next = !collapsed()
     setCollapsed(next)
@@ -234,6 +267,10 @@ function View(props: {
         >
           {loading() ? "Generating…" : "Recap"}
         </text>
+        {/* Runtime picker entry (ticket 05): click to open the DialogSelect. */}
+        <text fg={theme().textMuted} onMouseDown={props.onPickModel}>
+          {`Model: ${props.currentModelRaw() ?? "auto (session)"}`}
+        </text>
         {/* Marked stale, not erased: an old Recap still orients. */}
         <Show when={!loading() && recap() !== null && stale()}>
           <text fg={theme().textMuted}>
@@ -251,7 +288,7 @@ function View(props: {
 const tui: TuiPlugin = async (api, rawOptions) => {
   const { client } = api
 
-  const toast = (variant: "error" | "warning", message: string) =>
+  const toast = (variant: "error" | "success" | "warning", message: string) =>
     api.ui.toast({ variant, title: RECAP_TITLE, message })
 
   // Tuple options from tui.json: recognized keys typed here; unknown keys are
@@ -265,6 +302,78 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     )
   }
   const resolveRecapModel = createModelResolver(api, recapOptions.model)
+
+  // Runtime pick (ticket 05): the chosen ref lives in api.kv under
+  // RECAP_MODEL_KV_KEY and survives restarts. api.kv itself is not reactive,
+  // so the sidebar explicitly tracks runtimeVersion — bumped by every
+  // pick/reset; reads stay LIVE for the resolver regardless.
+  const [runtimeVersion, bumpRuntimeVersion] = createSignal(0)
+  const setRuntimeModel = (raw: string | null): void => {
+    api.kv.set(RECAP_MODEL_KV_KEY, raw)
+    bumpRuntimeVersion((v) => v + 1)
+  }
+
+  // The line and DialogSelect `current` marker show the same validated model
+  // that the next Recap call will use. Previewing is side-effect-free so an
+  // invalid config does not toast merely because the sidebar rendered.
+  const currentModelRaw = (sessionID: string): string | undefined => {
+    runtimeVersion()
+    const ref = resolveRecapModel(sessionID, false)
+    return ref ? modelRefString(ref) : undefined
+  }
+
+  // The dialog opens synchronously DURING the opening mousedown, so the paired
+  // mouseup lands inside the fresh dialog — on an option row (ghost pick) or on
+  // the backdrop (dismiss). Ignore selections within GHOST_CLICK_MS of
+  // opening: a deliberate pick (Enter or a second click) always comes later.
+  const GHOST_CLICK_MS = 350
+  let pickerOpenedAt = 0
+
+  function openModelPicker(sessionID: string): void {
+    const options = modelPickerOptions(api.state.provider)
+    if (!options.length) {
+      toast("warning", "Provider list is not loaded yet — cannot pick a Recap Model")
+      return
+    }
+    api.ui.dialog.setSize("large")
+    pickerOpenedAt = Date.now()
+    api.ui.dialog.replace(() => (
+      <api.ui.DialogSelect<string>
+        title="Recap Model"
+        flat={false}
+        current={currentModelRaw(sessionID)}
+        options={[
+          {
+            title: PICK_RESET_TITLE,
+            value: PICK_RESET_VALUE,
+            description: "Clear the runtime choice — configuration chain applies again",
+            category: "Reset",
+          },
+          ...options,
+        ]}
+        onSelect={(option) => {
+          if (Date.now() - pickerOpenedAt < GHOST_CLICK_MS) return
+          if (option.value === PICK_RESET_VALUE) {
+            setRuntimeModel(null)
+            toast("success", "Recap model reset — following configuration")
+            api.ui.dialog.clear()
+            return
+          }
+
+          // Re-check the live provider map at selection time. The dialog may
+          // have stayed open while provider availability changed.
+          const ref = parseModelRef(option.value)
+          if (!ref || !isKnownModel(ref, api.state.provider)) {
+            toast("error", `Recap model "${option.value}" is no longer available`)
+            return
+          }
+          setRuntimeModel(option.value)
+          toast("success", `Recap model set to ${option.value}`)
+          api.ui.dialog.clear()
+        }}
+      />
+    ))
+  }
 
   // Fetched ONCE at init and cached; core ids go into `tools` all-false.
   // Probe finding: MCP tools are NOT in this list and need the "*" entry.
@@ -434,6 +543,8 @@ const tui: TuiPlugin = async (api, rawOptions) => {
             session_id={props.session_id}
             staleAfter={recapOptions.stale_after}
             onRecap={() => generateRecap(props.session_id)}
+            currentModelRaw={() => currentModelRaw(props.session_id)}
+            onPickModel={() => openModelPicker(props.session_id)}
           />
         )
       },

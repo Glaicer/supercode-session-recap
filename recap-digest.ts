@@ -86,6 +86,7 @@ function foldToolPart(part: Record<string, unknown>): string {
     status?: unknown
     input?: Record<string, unknown>
     error?: unknown
+    metadata?: unknown
   }
   const name = typeof part.tool === "string" && part.tool ? part.tool : "tool"
   const input = state.input && typeof state.input === "object" ? state.input : {}
