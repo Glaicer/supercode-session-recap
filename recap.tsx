@@ -228,7 +228,7 @@ function View(props: {
 }) {
   const theme = () => props.api.theme.current
   // api.kv is a plain get/set store — keep a local signal for redraws and write through.
-  const [collapsed, setCollapsed] = createSignal(props.api.kv.get(COLLAPSE_KEY, false) === true)
+  const [collapsed, setCollapsed] = createSignal(props.api.kv.get<boolean>(COLLAPSE_KEY, false) === true)
   const toggleCollapsed = () => {
     const next = !collapsed()
     setCollapsed(next)
@@ -254,9 +254,12 @@ function View(props: {
 
   return (
     <box>
-      <text fg={theme().primary} attributes={TextAttributes.BOLD} onMouseDown={toggleCollapsed}>
-        {collapsed() ? "▸" : "▾"} {RECAP_TITLE}
-      </text>
+      <box flexDirection="row" gap={1} onMouseDown={toggleCollapsed}>
+        <text fg={theme().text}>{collapsed() ? "▶" : "▼"}</text>
+        <text fg={theme().text}>
+          <b>{RECAP_TITLE}</b>
+        </text>
+      </box>
       <Show when={!collapsed()}>
         <text
           fg={loading() ? theme().textMuted : theme().text}
@@ -395,7 +398,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     // deletion waits for that request to complete (enforced in the finally).
     // Idempotent: one abort POST per run no matter who triggers it.
     let stopRequest: Promise<unknown> | undefined
-    const stopRecapSession = (): Promise<void> => {
+    const stopRecapSession = (): Promise<unknown> => {
       if (!recapSessionID) return Promise.resolve()
       stopRequest ??= client.session.abort({ sessionID: recapSessionID }).catch(() => {
         // deletion below reports its own failures; an abort error adds nothing

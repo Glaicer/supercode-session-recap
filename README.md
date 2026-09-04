@@ -4,9 +4,11 @@ TUI-плагин OpenCode: секция `Recap` в сайдбаре сессии
 сессии в короткий Markdown — «над чем работаем / сделано / следующее» — и рисует его
 прямо в сайдбаре, не добавляя ничего в тред.
 
-Точка входа рантайма — `recap.tsx`; соседние `.ts`-файлы содержат чистую логику и её
-юнит-тесты. Сборки, `package.json` и `node_modules` у плагина нет: рантайм сам
-транспилирует JSX и использует собственные модули OpenTUI.
+Точка входа рантайма — `dist/recap.js` (сборка из `recap.tsx` через
+`npm run build`, Babel + `babel-preset-solid`, как в `token-usage-panel`);
+соседние `.ts`-файлы содержат чистую логику и её юнит-тесты. Пакет
+`@glaicer/supercode-session-recap` устроен как остальные TUI-плагины:
+`package.json`, `tsconfig.json`, `scripts/build.mjs` и `dist/`.
 
 ## Как работает
 
@@ -70,7 +72,7 @@ TUI-плагин OpenCode: секция `Recap` в сайдбаре сессии
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    ["/home/<you>/.config/opencode/plugins/recap.tsx", {
+    ["/home/<you>/.config/opencode/plugins/recap.js", {
       "model": "gonka-proxy/deepseek-ai/deepseek-v4-flash-0731",
       "stale_after": 3,
       "budget": 12000,
@@ -88,23 +90,28 @@ TUI-плагин OpenCode: секция `Recap` в сайдбаре сессии
 Нужны оба шага: симлинк в `plugins/` **и** запись пути в соответствующий `tui.json`.
 TUI-плагины не сканируются из директории автоматически — список берётся из массива
 `plugin` (проверено на 1.18.21, см. `../../.scratch/039-session-recap/probe/RESULTS.md`).
-Симлинк должен указывать на checkout целиком: `recap.tsx` импортирует соседние чистые
-модули.
+Симлинк должен указывать на собранный `dist/` целиком: `dist/recap.js`
+импортирует соседние собранные модули. Сначала соберите:
+
+```bash
+npm install
+npm run build
+```
 
 Глобальная установка:
 
 ```bash
 mkdir -p ~/.config/opencode/plugins
-ln -sfn "/path/to/supercode/plugins/session-recap/recap.tsx" \
-  ~/.config/opencode/plugins/recap.tsx
+ln -sfn "/path/to/supercode/plugins/session-recap/dist/recap.js" \
+  ~/.config/opencode/plugins/recap.js
 ```
 
 Локальная установка в проект `<project>`:
 
 ```bash
 mkdir -p "<project>/.opencode/plugins"
-ln -sfn "/path/to/supercode/plugins/session-recap/recap.tsx" \
-  "<project>/.opencode/plugins/recap.tsx"
+ln -sfn "/path/to/supercode/plugins/session-recap/dist/recap.js" \
+  "<project>/.opencode/plugins/recap.js"
 ```
 
 Для глобальной установки создайте `~/.config/opencode/tui.json`, для локальной —
@@ -115,7 +122,7 @@ ln -sfn "/path/to/supercode/plugins/session-recap/recap.tsx" \
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    ["/home/<you>/.config/opencode/plugins/recap.tsx", {
+    ["/home/<you>/.config/opencode/plugins/recap.js", {
       "model": "gonka-proxy/deepseek-ai/deepseek-v4-flash-0731",
       "stale_after": 3,
       "budget": 12000,
@@ -126,13 +133,15 @@ ln -sfn "/path/to/supercode/plugins/session-recap/recap.tsx" \
 ```
 
 Для локальной установки замените путь на
-`<project>/.opencode/plugins/recap.tsx`. Регистрируйте файл ровно один раз (глобально
+`<project>/.opencode/plugins/recap.js`. Регистрируйте файл ровно один раз (глобально
 **или** локально): две записи дают два инстанса с разными опциями.
 
 ## Проверка
 
 ```bash
 node --test        # юнит-тесты чистой логики (без TUI)
+npm run typecheck  # tsc --noEmit
+npm run build      # пересобрать dist/ после правок исходников
 opencode   # открыть TUI в любом проекте
 # ctrl+p → «plugins» → supercode.recap должен быть в списке со статусом active
 # начать сессию, написать пару сообщений, кликнуть «Recap» в сайдбаре
@@ -191,9 +200,10 @@ select count(*) from session where title = 'recap';
 `title = 'recap'` в SQLite. API-пробники и E2E цепочки конфигурационной модели записаны в
 `../../.scratch/039-session-recap/probe/RESULTS.md`.
 
-В standalone checkout соседние `.ts`-файлы и тесты намеренно остаются: они образуют
-чистый unit-seam тикетов 02–04. Для установки нужен только симлинк на `recap.tsx`; у
-плагина по-прежнему нет `package.json`, `node_modules` и отдельного build-шагa.
+В standalone checkout исходники (`.ts`/`.tsx`) и тесты намеренно остаются рядом:
+они образуют чистый unit-seam тикетов 02–04. Для установки соберите `dist/`
+(`npm run build`) и поставьте симлинк на `dist/recap.js`; соседние собранные
+`.js`-модули должны лежать рядом в том же `dist/`.
 
 ## Атрибуция
 

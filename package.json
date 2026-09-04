@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@glaicer/supercode-session-recap",
+  "version": "0.1.0",
+  "description": "OpenCode TUI sidebar section: Recap the current session into Working on / Done / Next.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Dmitrii Aronov <aronov.mml@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Glaicer/supercode-session-recap.git"
+  },
+  "homepage": "https://github.com/Glaicer/supercode-session-recap#readme",
+  "bugs": {
+    "url": "https://github.com/Glaicer/supercode-session-recap/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tui-plugin",
+    "session-recap"
+  ],
+  "exports": {
+    "./tui": "./dist/recap.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check:package": "node scripts/check-package.mjs",
+    "prepack": "npm run build && npm run check:package",
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": ">=1.18.21",
+    "@opentui/core": ">=0.4.5",
+    "@opentui/solid": ">=0.4.5",
+    "solid-js": "1.9.12"
+  },
+  "devDependencies": {
+    "@babel/core": "7.28.0",
+    "@babel/preset-typescript": "7.27.1",
+    "@opencode-ai/sdk": "1.18.21",
+    "@types/node": "24.13.3",
+    "babel-preset-solid": "1.9.12",
+    "typescript": "5.8.2"
+  },
+  "engines": {
+    "node": ">=24",
+    "opencode": ">=1.18.21"
+  }
+}
