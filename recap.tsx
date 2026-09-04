@@ -11,7 +11,7 @@
  * covered, so the next Digest folds only messages after it and feeds the
  * stored Recap back as the PREVIOUS RECAP context block.
  *
- * Tool suppression is proven by probe (see .scratch/039-tui-session-recap/probe/):
+ * Tool suppression is proven by probe (see .scratch/039-session-recap/probe/):
  * explicit `false` for every id from client.tool.ids() kills core tools, but MCP
  * tools leak past it — `"*": false` covers those.
  *

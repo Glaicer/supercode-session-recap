@@ -87,7 +87,7 @@ TUI-плагин OpenCode: секция `Recap` в сайдбаре сессии
 
 Нужны оба шага: симлинк в `plugins/` **и** запись пути в соответствующий `tui.json`.
 TUI-плагины не сканируются из директории автоматически — список берётся из массива
-`plugin` (проверено на 1.18.21, см. `../../.scratch/039-tui-session-recap/probe/RESULTS.md`).
+`plugin` (проверено на 1.18.21, см. `../../.scratch/039-session-recap/probe/RESULTS.md`).
 Симлинк должен указывать на checkout целиком: `recap.tsx` импортирует соседние чистые
 модули.
 
@@ -95,7 +95,7 @@ TUI-плагины не сканируются из директории авт�
 
 ```bash
 mkdir -p ~/.config/opencode/plugins
-ln -sfn "/path/to/supercode/plugins/tui-session-recap/recap.tsx" \
+ln -sfn "/path/to/supercode/plugins/session-recap/recap.tsx" \
   ~/.config/opencode/plugins/recap.tsx
 ```
 
@@ -103,7 +103,7 @@ ln -sfn "/path/to/supercode/plugins/tui-session-recap/recap.tsx" \
 
 ```bash
 mkdir -p "<project>/.opencode/plugins"
-ln -sfn "/path/to/supercode/plugins/tui-session-recap/recap.tsx" \
+ln -sfn "/path/to/supercode/plugins/session-recap/recap.tsx" \
   "<project>/.opencode/plugins/recap.tsx"
 ```
 
@@ -183,13 +183,13 @@ select count(*) from session where title = 'recap';
 
 ### Зафиксированный clean-install прогон
 
-`../../.scratch/039-tui-session-recap/probe/e2e_runtime_picker.py` прогнан 2026-08-24
+`../../.scratch/039-session-recap/probe/e2e_runtime_picker.py` прогнан 2026-08-24
 на OpenCode 1.18.21 во временном проекте с единственным plugin-инстансом. Запись прогона
 подтвердила: группированный picker и текущий выбор, runtime override без перезапуска,
 сброс к `small_model` без перезапуска, одну строку в collapsed-состоянии, сохранение
 выбора и collapse после перезапуска, повторный Recap на сохранённой модели и `0` строк
 `title = 'recap'` в SQLite. API-пробники и E2E цепочки конфигурационной модели записаны в
-`../../.scratch/039-tui-session-recap/probe/RESULTS.md`.
+`../../.scratch/039-session-recap/probe/RESULTS.md`.
 
 В standalone checkout соседние `.ts`-файлы и тесты намеренно остаются: они образуют
 чистый unit-seam тикетов 02–04. Для установки нужен только симлинк на `recap.tsx`; у
@@ -199,4 +199,4 @@ select count(*) from session where title = 'recap';
 
 Идея и два приёма (регистрация слота `sidebar_content`, одноразовая сессия как one-shot
 LLM-вызов) заимствованы из MIT-плагина [`streetturtle/opencode-recap`](https://github.com/streetturtle/opencode-recap);
-код написан заново — разбор отличий в `../../Features/039-tui-session-recap.md`.
+код написан заново — разбор отличий в `../../Features/039-session-recap.md`.
