@@ -5,9 +5,9 @@
  * Recap Digest (one line per tool call, reasoning dropped, long text cut
  * visibly, budgeted with overflow dropped from the head), runs ONE synchronous
  * `session.prompt` against a throwaway child session with every tool disabled,
- * renders the Markdown reply in the sidebar and deletes the session. The first
- * Recap for a session is queued when its sidebar section first renders, so a
- * session opened mid-history still gets one without waiting for a turn.
+ * renders the Markdown reply in the sidebar and deletes the session. Nothing
+ * runs on render or while a turn is still going — a session opened mid-history
+ * gets its first Recap when its next turn finishes.
  *
  * The window is incremental: a successful Recap stores the messageID it
  * covered, so the next Digest folds only messages after it and feeds the
@@ -35,9 +35,9 @@
  *
  * The sidebar is display-only: a collapsible header (expanded by default, the
  * choice persists in api.kv), the latest Recap and a Generating indicator —
- * while the first turn is still running and no Recap has completed yet, a
- * "Waiting for the first turn to finish?" note is shown instead, because the
- * generation itself only starts at session.idle.
+ * while no Recap has completed yet and the session is not idle, a
+ * "Waiting for the first turn to finish." note is shown instead, because
+ * generation only starts at session.idle.
  * There are no buttons, no picker and no model state.
  */
 /** @jsxImportSource @opentui/solid */
@@ -183,7 +183,7 @@ function buildSyntaxStyle(api: TuiPluginApi): SyntaxStyle {
   })
 }
 
-function View(props: { api: TuiPluginApi; session_id: string; onAutoStart: () => void }) {
+function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
   // api.kv is a plain get/set store — keep a local signal for redraws and write through.
   const [expanded, setExpanded] = createSignal(props.api.kv.get<boolean>(EXPANDED_KEY, true) !== false)
@@ -193,21 +193,14 @@ function View(props: { api: TuiPluginApi; session_id: string; onAutoStart: () =>
     props.api.kv.set(EXPANDED_KEY, next)
   }
   const record = () => sessionRecord(props.session_id)
-  // First render for a session queues its first automatic Recap — once per
-  // session per process. The run itself happens off-render; every later turn
-  // re-triggers via session.idle.
-  if (!record().autoQueued) {
-    record().autoQueued = true
-    queueMicrotask(() => props.onAutoStart())
-  }
+  // Generation triggers only via session.idle (turn end) — never on render,
+  // so no Recap runs while a turn is still going.
   const recap = () => recapSignalOf(record())[0]()
   const loading = () => loadingSignalOf(record())[0]()
   const syntaxStyle = () => buildSyntaxStyle(props.api)
-  // First turn still running: the auto-queued Recap is stuck behind the agent
-  // turn (generation only starts at session.idle), so "Generating…" would lie.
-  // While no Recap has ever completed and the session is not idle, show the
-  // waiting note instead. A mid-history session recapping while idle still
-  // shows "Generating…" — its generation really has started.
+  // Generation only starts at session.idle, so "Generating…" would lie while a
+  // turn is still running. While no Recap has ever completed and the session
+  // is not idle, show the waiting note instead.
   const hasCompletedRecap = () => record().anchor !== undefined || record().lastRecap !== undefined
   const sessionNotIdle = () => {
     try {
@@ -216,7 +209,7 @@ function View(props: { api: TuiPluginApi; session_id: string; onAutoStart: () =>
       return true
     }
   }
-  const waitingForFirstTurn = () => loading() && !hasCompletedRecap() && sessionNotIdle()
+  const waitingForFirstTurn = () => !hasCompletedRecap() && sessionNotIdle()
 
   return (
     <box>
@@ -421,7 +414,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     order: 900,
     slots: {
       sidebar_content(_ctx, props) {
-        return <View api={api} session_id={props.session_id} onAutoStart={() => void generateRecap(props.session_id)} />
+        return <View api={api} session_id={props.session_id} />
       },
     },
   })

@@ -1,79 +1,47 @@
-# supercode.recap
+# session-recap
 
-TUI-плагин OpenCode: секция `Recap` в сайдбаре сессии. После каждого завершённого
-терна (`session.idle`) сворачивает сессию в Recap из максимум двух коротких предложений
-(что происходит и что дальше) — и рисует его прямо в сайдбаре, не добавляя ничего в тред.
-Первый Recap для сессии ставится в очередь при первом рендере сайдбара, так что
-сессия, открытая посередине истории, тоже получает Recap без ожидания терна.
+An OpenCode plugin that adds a collapsible **recap** section to the TUI session sidebar. After every finished turn it folds the session into a recap of at most two short sentences.
 
-Точка входа рантайма — `dist/recap.js` (сборка из `recap.tsx` через
-`npm run build`, Babel + `babel-preset-solid`);
-соседние `.ts`-файлы содержат чистую логику и её юнит-тесты. Пакет
-`@glaicer/supercode-session-recap` устроен как остальные TUI-плагины:
-`package.json`, `tsconfig.json`, `scripts/build.mjs` и `dist/`.
+OpenCode's `small_model` (the same model that generates session titles) produces the recap in a throwaway child session.
 
-## Как работает
+## Install
 
-1. Триггер — событие `session.idle` (конец терна) для основных сессий. Дочерние
-   сессии (одноразовые Recap-сессии, сабагенты — всё, у чего есть `parentID`) Recap
-   не запускают, плюс собственные Recap-сессии отслеживаются по ID на случай, если
-   состояние TUI их ещё не подтянуло.
-2. Recap Digest — свёртка сессии из состояния TUI (`api.state.session.messages`),
-   не по HTTP: одна строка на каждый tool-вызов (`[tool] имя аргумент -> ok|error:
-   первая строка ошибки`; правки файлов дают путь и знак изменения `(+N -M)`, без
-   содержимого диффа), `text`-части как есть с видимой обрезкой длинных,
-   `reasoning` отбрасывается целиком. Бюджет в символах (`budget`, дефолт 12000):
-   при переполнении материал отбрасывается **с головы окна** — хвост важнее; окно
-   инкрементальное — после успешного Recap хранится `messageID`, который он покрыл,
-   и следующий Digest берёт только сообщения после него, подавая предыдущий Recap
-   отдельным блоком `PREVIOUS RECAP`. Факт усечения попадает в промпт явной строкой.
-3. Recap Model — `small_model` из конфига OpenCode (та же модель, что генерирует
-   заголовки сессий). Единственный оверрайд — опция `model` из `tui.json`.
-   Кандидат валидируется против списка провайдеров **до** вызова; невалидный/
-   неизвестный даёт один error-тост на источник за процесс (`tui.json` /
-   `small_model`). Если не разрезолвилось ничего — запрос уходит без поля `model`,
-   сервер применит дефолтную.
-4. Recap Session — одноразовая дочерняя сессия (`parentID`, `title: "recap"`); в ней
-   один синхронный `session.prompt` со своим `system` и всеми тулами, выставленными
-   в `false` (+ `"*": false` — MCP-тулы через id-список не гасятся).
-5. Markdown берётся из `parts` ответа; Recap Session удаляется в `finally` (неуспех
-   удаления — тост). Ошибки вызова — error-тост, предыдущий Recap не трогается и в
-   контексте следующего не оказывается: строка ошибки живёт только в тосте, в
-   состоянии Recap её нет.
-6. Сайдбар — только отображение: заголовок (клик сворачивает секцию в одну строку;
-   по умолчанию развёрнута, выбор живёт в `api.kv`), индикатор `Generating…`
-   во время прогона и сам Markdown. Пока первый терн ещё идёт и ни одного Recap
-   нет, вместо `Generating…` показывается `Waiting for the first turn to finish?`
-   — генерация стартует только по `session.idle`. Кнопок и выбора модели нет.
-7. Устойчивость: повторный триггер во время работы возвращает тот же промис (guard
-   живёт в функции — вторая Recap Session не создаётся); вызов гоняется против
-   `AbortController`, связанного с `api.lifecycle.signal` и таймаутом `timeout_ms` —
-   по таймауту сначала `session.abort` на Recap Session, затем удаление;
-   пер-сессионное состояние лежит в LRU-ограниченном хранилище, стирается по
-   `session.deleted` и при деактивации плагина/выключении TUI
-   (`api.lifecycle.onDispose`).
+Install with the OpenCode CLI. It detects the TUI target and registers the plugin in `tui.json` for you:
 
-Чистая логика модели (`parseModelRef`, опции, валидация), сборка Digest
-(`buildRecapDigest`, `buildRecapRequest`) и LRU-хранилище вынесены в файлы без
-TUI-импортов и покрыты юнит-тестами: `node --test`.
+```bash
+opencode plugin @glaicer/supercode-session-recap
+```
 
-## Опции
+- `--global` installs into the global config (`~/.config/opencode`); default is local (`.opencode` in the current project).
+- `--force` replaces an already-installed version.
+- Restart OpenCode after installing.
 
-Второй элемент кортежа в `tui.json`. Все ключи опциональны; отсутствие `tui.json` —
-штатный режим. Нераспознанный ключ игнорируется молча; распознанный не того типа —
-один warning-тост при старте и значение по умолчанию.
+Manual install also works: add the package to the `plugin` array in `tui.json` (global `~/.config/opencode/tui.json` or local `<project>/.opencode/tui.json`):
 
-| Ключ | Тип | Дефолт | Смысл |
+```jsonc
+{
+  "plugin": ["@glaicer/supercode-session-recap"]
+}
+```
+
+> [!IMPORTANT]
+> **The first OpenCode load after installing this plugin may be slow.** That's OpenCode downloading the plugin's packages and managed tools into its cache. It happens once. Every subsequent start is fast.
+
+## Options
+
+Options live in the second tuple element in `tui.json`. All keys are optional. The plugin ignores an unrecognized key silently. A recognized key with the wrong type produces one warning toast at startup, and the default applies.
+
+| Key | Type | Default | Meaning |
 |---|---|---|---|
-| `model` | string `provider/model-id` | — (`small_model`) | оверрайд Recap Model; id может содержать `/` |
-| `budget` | number | `12000` | бюджет Recap Digest в символах; переполнение отбрасывается с головы окна |
-| `timeout_ms` | number | `60000` | таймаут вызова: `session.abort` на Recap Session, затем удаление |
+| `model` | string `provider/model-id` | `small_model` | Recap model override; the id may contain `/` |
+| `budget` | number | `12000` | Recap digest budget in characters; the plugin drops overflow from the head of the window |
+| `timeout_ms` | number | `60000` | Call timeout: aborts the recap session, then deletes it |
 
-```json
+```jsonc
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    ["/home/<you>/.config/opencode/plugins/recap.js", {
+    ["@glaicer/supercode-session-recap", {
       "budget": 12000,
       "timeout_ms": 60000
     }]
@@ -81,44 +49,7 @@ TUI-импортов и покрыты юнит-тестами: `node --test`.
 }
 ```
 
-**Регистрируйте файл ровно один раз** (глобально ИЛИ локально): две записи одного
-файла дают два инстанса с разными опциями.
-
-## Установка
-
-Нужны оба шага: симлинк в `plugins/` **и** запись пути в соответствующий `tui.json`.
-TUI-плагины не сканируются из директории автоматически — список берётся из массива
-`plugin` (проверено на 1.18.21).
-Симлинк должен указывать на собранный `dist/` целиком: `dist/recap.js`
-импортирует соседние собранные модули. Сначала соберите:
-
-```bash
-npm install
-npm run build
-```
-
-Глобальная установка:
-
-```bash
-mkdir -p ~/.config/opencode/plugins
-ln -sfn "/path/to/supercode/plugins/session-recap/dist/recap.js" \
-  ~/.config/opencode/plugins/recap.js
-```
-
-Локальная установка в проект `<project>`:
-
-```bash
-mkdir -p "<project>/.opencode/plugins"
-ln -sfn "/path/to/supercode/plugins/session-recap/dist/recap.js" \
-  "<project>/.opencode/plugins/recap.js"
-```
-
-Для глобальной установки создайте `~/.config/opencode/tui.json`, для локальной —
-`<project>/.opencode/tui.json`. Путь в JSON — абсолютный путь к симлинку; опции приходят
-вторым элементом кортежа (см. выше). Регистрируйте файл ровно один раз (глобально
-**или** локально): две записи дают два инстанса с разными опциями.
-
-`small_model` задаётся в конфиге OpenCode (`~/.config/opencode/opencode.json`):
+You can adjust `small_model` in the OpenCode config (`~/.config/opencode/opencode.json`):
 
 ```json
 {
@@ -127,58 +58,15 @@ ln -sfn "/path/to/supercode/plugins/session-recap/dist/recap.js" \
 }
 ```
 
-## Проверка
+## Development
 
 ```bash
-node --test        # юнит-тесты чистой логики (без TUI)
-npm run typecheck  # tsc --noEmit
-npm run build      # пересобрать dist/ после правок исходников
-opencode   # открыть TUI в любом проекте
-# ctrl+p → «plugins» → supercode.recap должен быть в списке со статусом active
-# начать сессию, написать сообщение — после ответа в сайдбаре появляется Recap
+npm run typecheck   # tsc --noEmit
+npm test            # node --test, network-free: pure logic, no TUI
+npm run build       # precompile Solid TSX into dist
+npm pack --dry-run  # build and verify the publish artifact
 ```
 
-Ожидаемо: после каждого ответа ассистента под заголовком `Recap` появляется Markdown
-ровно двумя короткими предложениями без заголовков и списков; в списке
-сессий одноразовая Recap Session не остаётся (удаляется автоматически).
+## Attribution
 
-### Ручной verification-чеклист
-
-Прогоняйте его от начала до конца после чистой установки (один plugin-инстанс, новый
-проект, новый TUI):
-
-- [ ] установить симлинк в глобальный **или** локальный `plugins/` и добавить тот же путь
-  в соответствующий `tui.json`;
-- [ ] открыть Plugins и проверить `supercode.recap` со статусом `active`, затем написать
-  сообщение — после ответа в сайдбаре появляется Recap из максимум двух предложений;
-- [ ] секция `Recap` в сайдбаре развёрнута по умолчанию; клик по заголовку сворачивает
-  её в одну строку, выбор переживает перезапуск TUI;
-- [ ] сессия почти целиком из tool-вызовов даёт содержательный Recap, а не
-  «*No Recap material yet.*»;
-- [ ] после новых сообщений следующий Recap берёт только хвост после предыдущего и
-  передаёт предыдущий как `PREVIOUS RECAP`;
-- [ ] во время одного прогона не создаётся вторая Recap Session; `timeout_ms: 5000` на
-  висящем провайдере даёт timeout-тост, удаляет Recap Session;
-- [ ] битая `model` в `tui.json` даёт один error-тост и падает на `small_model`;
-- [ ] выключенный провайдер даёт error-тост и сохраняет предыдущий Recap; после включения
-  следующий успех не передаёт текст ошибки в `PREVIOUS RECAP`;
-- [ ] после удаления сессии её состояние исчезает; после
-  `api.plugins.deactivate("supercode.recap")` обработчики больше не срабатывают.
-
-Проверка SQLite для созданной/удалённой одноразовой сессии:
-
-```sql
-select count(*) from session where title = 'recap';
-```
-
-После успешного или неуспешного прогона результат должен быть `0`.
-
-В standalone checkout исходники (`.ts`/`.tsx`) и тесты намеренно остаются рядом.
-Для установки соберите `dist/` (`npm run build`) и поставьте симлинк на
-`dist/recap.js`; соседние собранные `.js`-модули должны лежать рядом в том же `dist/`.
-
-## Атрибуция
-
-Идея и два приёма (регистрация слота `sidebar_content`, одноразовая сессия как one-shot
-LLM-вызов) заимствованы из MIT-плагина [`streetturtle/opencode-recap`](https://github.com/streetturtle/opencode-recap);
-код написан заново.
+The idea was inspired by [`streetturtle/opencode-recap`](https://github.com/streetturtle/opencode-recap). The code is original.

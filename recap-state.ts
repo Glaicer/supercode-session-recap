@@ -17,8 +17,6 @@ export type RecapSessionRecord = {
   anchor: string | undefined
   /** Markdown of the last SUCCESSFUL Recap — the only source of PREVIOUS RECAP. */
   lastRecap: string | undefined
-  /** Set once the first automatic Recap has been queued — one per session. */
-  autoQueued: boolean
   recap: ValueSignal<string | null> | undefined
   loading: ValueSignal<boolean> | undefined
 }
@@ -27,7 +25,6 @@ export function createRecapRecord(): RecapSessionRecord {
   return {
     anchor: undefined,
     lastRecap: undefined,
-    autoQueued: false,
     recap: undefined,
     loading: undefined,
   }

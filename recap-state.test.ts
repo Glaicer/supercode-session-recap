@@ -50,11 +50,10 @@ describe("LruMap", () => {
 })
 
 describe("createRecapRecord", () => {
-  it("starts with no anchor, no lastRecap, nothing queued and no signals", () => {
+  it("starts with no anchor, no lastRecap and no signals", () => {
     const record = createRecapRecord()
     assert.equal(record.anchor, undefined)
     assert.equal(record.lastRecap, undefined)
-    assert.equal(record.autoQueued, false)
     assert.equal(record.recap, undefined)
     assert.equal(record.loading, undefined)
   })
