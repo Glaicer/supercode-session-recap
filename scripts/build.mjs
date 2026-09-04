@@ -7,8 +7,8 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = resolve(root, "dist");
-// Pure logic modules plus the TUI entry. Tests stay out of dist.
-const sources = ["recap-model.ts", "recap-digest.ts", "recap-staleness.ts", "recap-state.ts", "recap.tsx"];
+// Tests stay out of dist.
+const sources = ["recap-model.ts", "recap-digest.ts", "recap-state.ts", "recap.tsx"];
 
 function rewriteTypeScriptExtensions() {
   const rewrite = (path) => {

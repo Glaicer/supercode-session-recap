@@ -28,7 +28,6 @@ const files = pack.files.map((file) => file.path);
 assert.ok(files.includes("dist/recap.js"), "tarball must include the compiled TUI entry");
 assert.ok(files.includes("dist/recap-model.js"), "tarball must include the compiled model");
 assert.ok(files.includes("dist/recap-digest.js"), "tarball must include the compiled digest");
-assert.ok(files.includes("dist/recap-staleness.js"), "tarball must include the compiled staleness");
 assert.ok(files.includes("dist/recap-state.js"), "tarball must include the compiled state");
 assert.ok(!files.some((file) => file.endsWith(".ts") || file.endsWith(".tsx")), "tarball must not include raw sources");
 

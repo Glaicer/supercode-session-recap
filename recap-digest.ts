@@ -1,8 +1,4 @@
-/**
- * Pure Recap Digest builder: folds session messages into a size-bounded
- * transcript that keeps tool work visible. No @opentui/* imports — runs under
- * `node --test` away from the TUI.
- */
+/** No @opentui/* imports — runs under `node --test` away from the TUI. */
 import { DIGEST_DEFAULT_BUDGET, unwrapMessage } from "./recap-model.ts"
 
 export { DIGEST_DEFAULT_BUDGET }
@@ -33,9 +29,7 @@ export type DigestMessage = {
 }
 
 export type DigestBuild = {
-  /** Assembled window text; "" when there is nothing to fold. */
   digest: string
-  /** True when material was dropped: head-of-window cut or a within-message cut. */
   truncated: boolean
   /**
    * messageID of the last message this build covered — stored as the anchor
@@ -112,8 +106,6 @@ function foldTextPart(part: Record<string, unknown>): string {
   return `${body.slice(0, TEXT_PART_LIMIT)}\n[…text truncated — ${body.length - TEXT_PART_LIMIT} more characters cut]`
 }
 
-// One message -> one block. reasoning parts are dropped entirely; text parts
-// are kept with long ones cut visibly; each tool call becomes one line.
 function foldMessage(entry: DigestMessage): string {
   const info = unwrapMessage(entry)
   if (!info) return ""
@@ -156,7 +148,7 @@ export function buildRecapDigest(
   const folded = window.map(foldMessage).filter((text) => text.length > 0)
 
   // Budget walk from the tail: the newest material survives, overflow drops
-  // from the head of the window — the tail is what is forgotten least.
+  // from the head of the window.
   const keptReversed: string[] = []
   let total = 0
   let truncated = false
@@ -199,11 +191,9 @@ export function buildRecapRequest(args: {
   truncated?: boolean
 }): string {
   const blocks = [
-    "Summarize the coding session below. Answer with exactly three sections, in this order:\n" +
-      "**Working on:** one sentence — what is being built or explored right now\n" +
-      "**Done:** up to 3 short bullets of what is already finished (skip if nothing yet)\n" +
-      "**Next:** one bullet — the immediate next step\n" +
-      "No intro, no outro, no other sections.",
+    "Summarize the coding session below in at most two short sentences: " +
+      "what is happening right now and what comes next. " +
+      "Plain sentences only — no headings, no bullets, no lists, no intro, no outro.",
   ]
   if (args.previousRecap) {
     blocks.push("PREVIOUS RECAP — context from earlier session history:\n" + args.previousRecap)

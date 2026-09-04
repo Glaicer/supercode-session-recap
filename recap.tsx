@@ -1,65 +1,58 @@
 /**
- * supercode.recap — TUI sidebar section showing a Recap of the current session.
+ * supercode.recap — TUI sidebar section showing an automatic Recap of the current session.
  *
- * Click `Recap` → the plugin folds the session into a Recap Digest (one line
- * per tool call, reasoning dropped, long text cut visibly, budgeted with
- * overflow dropped from the head), runs ONE synchronous `session.prompt`
- * against a throwaway child session with every tool disabled, renders the
- * Markdown reply in the sidebar and deletes the session.
+ * After every turn end (`session.idle`) the plugin folds the session into a
+ * Recap Digest (one line per tool call, reasoning dropped, long text cut
+ * visibly, budgeted with overflow dropped from the head), runs ONE synchronous
+ * `session.prompt` against a throwaway child session with every tool disabled,
+ * renders the Markdown reply in the sidebar and deletes the session. The first
+ * Recap for a session is queued when its sidebar section first renders, so a
+ * session opened mid-history still gets one without waiting for a turn.
  *
  * The window is incremental: a successful Recap stores the messageID it
  * covered, so the next Digest folds only messages after it and feeds the
  * stored Recap back as the PREVIOUS RECAP context block.
  *
- * Tool suppression is proven by probe (see .scratch/039-session-recap/probe/):
- * explicit `false` for every id from client.tool.ids() kills core tools, but MCP
- * tools leak past it — `"*": false` covers those.
+ * Tool suppression: explicit `false` for every id from client.tool.ids()
+ * disables core tools, but MCP tools are not in that list — `"*": false`
+ * covers those.
  *
- * Recap Model comes from configuration (tuple options in tui.json) or a
- * RUNTIME pick (ticket 05): a DialogSelect over api.state.provider, grouped by
- * provider, writes the chosen `provider/model-id` string to api.kv under
- * "recap.model", so it survives TUI restarts and overrides configuration;
- * picking "Follow configuration" clears the key and the chain of ticket 02
- * applies again on the very next click, no restart. The chain resolves by
- * first successfully resolved candidate wins: runtime (api.kv) → plugin
- * `model` option → `small_model` from config → model of the last assistant
- * message. Every candidate is validated against api.state.provider BEFORE the
- * prompt call; an invalid or unknown value gets one error toast per failing
- * source per process, then the next chain level is tried. Parsing lives in
- * ./recap-model.ts — pure, unit-tested away from the TUI.
+ * The Recap Model is OpenCode's `small_model` — the same one used for session
+ * title generation — with an explicit `model` option from tui.json as the only
+ * override. The candidate is validated against api.state.provider BEFORE the
+ * prompt call; an invalid or unknown value gets one error toast per source per
+ * process and the prompt goes out without a `model` field (server default).
+ * Parsing lives in ./recap-model.ts — pure, unit-tested away from the TUI.
  *
- * Resilience (ticket 04): a click while a Recap runs returns the SAME promise
+ * Resilience: an idle event while a Recap runs returns the SAME promise
  * instead of starting a second Recap Session; a run is raced against an
  * AbortController linked to api.lifecycle.signal plus a timeout_ms timer that
  * stops the Recap Session via session.abort before deletion; failures go to an
  * error toast and never touch the previous Recap; per-session state lives in an
- * LRU-bounded map, dropped on session.deleted and on dispose. Recap Staleness
- * counts the session's OWN messages after a successful Recap (never
- * session.status transitions — compaction, subagents and retries must not
- * count) and marks the Recap stale without erasing it.
+ * LRU-bounded map, dropped on session.deleted and on dispose. Idle events for
+ * child sessions (our own throwaway Recap Sessions, subagents) never trigger a
+ * Recap — only parentless main sessions are recapped.
  *
- * The section header folds the whole section into one line (ticket 05); the
- * collapsed flag lives in api.kv and survives restarts. The `Model:` line
- * opens the runtime picker; it also shows what the chain would resolve to now.
+ * The sidebar is display-only: a collapsible header (expanded by default, the
+ * choice persists in api.kv), the latest Recap and a Generating indicator —
+ * while the first turn is still running and no Recap has completed yet, a
+ * "Waiting for the first turn to finish?" note is shown instead, because the
+ * generation itself only starts at session.idle.
+ * There are no buttons, no picker and no model state.
  */
 /** @jsxImportSource @opentui/solid */
-import { createMemo, createSignal, Show } from "solid-js"
-import { SyntaxStyle, TextAttributes } from "@opentui/core"
+import { createSignal, Show } from "solid-js"
+import { SyntaxStyle } from "@opentui/core"
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import {
   type ModelRef,
   type ModelSource,
   isKnownModel,
-  modelPickerOptions,
-  modelRefString,
   parseModelRef,
   parseRecapOptions,
-  RECAP_MODEL_KV_KEY,
-  sessionModelRef,
   unwrapMessage,
 } from "./recap-model.ts"
 import { buildRecapDigest, buildRecapRequest } from "./recap-digest.ts"
-import { countUserMessages, isRecapStale } from "./recap-staleness.ts"
 import {
   createRecapRecord,
   LruMap,
@@ -69,28 +62,31 @@ import {
 } from "./recap-state.ts"
 
 const RECAP_TITLE = "Recap"
-const COLLAPSE_KEY = "supercode.recap.collapsed"
+const WAITING_FOR_FIRST_TURN = "Waiting for the first turn to finish."
+// Fresh key: the old "supercode.recap.collapsed" key may still hold a stale
+// `true` in kv.json — this starts everyone expanded again. Orphaned old keys
+// in kv.json are inert and can be deleted by hand.
+const EXPANDED_KEY = "supercode.recap.expanded"
 
-// Runtime picker: first entry clears the runtime choice; the rest come from
-// modelPickerOptions(api.state.provider), grouped by provider via `category`.
-const PICK_RESET_VALUE = "__follow-configuration__"
-const PICK_RESET_TITLE = "Follow configuration"
-
-// Per-session Recap state, LRU-bounded by session count. The anchor marks the
-// last message covered by a SUCCESSFUL Recap (next Digest folds only what came
-// after it); lastRecap is the stored Recap itself fed back as the PREVIOUS
-// RECAP context block. Failed attempts touch neither — a failed Recap must
-// never become the context of the next one.
+// The anchor marks the last message covered by a SUCCESSFUL Recap (next Digest
+// folds only what came after it); lastRecap is the stored Recap itself fed back
+// as the PREVIOUS RECAP context block. Failed attempts touch neither — a failed
+// Recap must never become the context of the next one.
 const sessionRecords = new LruMap<string, RecapSessionRecord>(RECAP_SESSION_STATE_LIMIT)
 
-// In-flight guard keyed by sessionID: a second click returns THE SAME promise
+// In-flight guard keyed by sessionID: a second trigger returns THE SAME promise
 // instead of creating another Recap Session. The guard deliberately lives in
-// generateRecap, not in the component's loading() check.
+// generateRecap, not in the caller.
 const inFlight = new Map<string, Promise<void>>()
 
 // AbortControllers of running Recaps — aborted by session.deleted for the
-// deleted session and by dispose for all. Self-cleaning: removed when the run settles.
+// deleted session and by dispose for all.
 const inFlightControllers = new Map<string, AbortController>()
+
+// IDs of our own throwaway Recap Sessions (created with a parentID). Their
+// session.idle — fired when the one prompt resolves — must never trigger a
+// Recap of the Recap Session itself. Entries leave on session.deleted.
+const recapChildIDs = new Set<string>()
 
 function sessionRecord(sessionID: string): RecapSessionRecord {
   let record = sessionRecords.get(sessionID)
@@ -111,35 +107,21 @@ function loadingSignalOf(record: RecapSessionRecord): ValueSignal<boolean> {
   return record.loading
 }
 
-function baselineSignalOf(record: RecapSessionRecord): ValueSignal<number | null> {
-  record.baseline ??= createSignal<number | null>(null) as ValueSignal<number | null>
-  return record.baseline
-}
-
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message
   const data = (err as { data?: { message?: string } })?.data
   return data?.message ?? String(err)
 }
 
-// Recap Model chain, first successfully resolved candidate wins:
-// RUNTIME pick (api.kv "recap.model", ticket 05) -> plugin `model` option
-// (tui.json) -> config.small_model -> model of the session's last assistant
-// message. Every parsed candidate is validated against api.state.provider
-// before it can win; a failing source gets ONE error toast per process (keyed
-// by source, not per click) and the next level is tried. With nothing resolved
-// the prompt goes out without a `model` field and the server applies its default.
-
-// api.kv has no delete: null is our written "no runtime choice" marker and the
-// fallback for a never-set key, so both states read identically as unset.
-function runtimeModelRaw(api: TuiPluginApi): string | undefined {
-  const raw = api.kv.get<string | null>(RECAP_MODEL_KV_KEY, null)
-  return typeof raw === "string" && raw ? raw : undefined
-}
-
+// Recap Model: explicit `model` option (tui.json) wins, otherwise OpenCode's
+// `small_model` — the same one used for session title generation. Every parsed
+// candidate is validated against api.state.provider before it can win; a
+// PRESENT bad value gets ONE error toast per process (keyed by source) and the
+// next level is tried. With nothing resolved the prompt goes out without a
+// `model` field and the server applies its default.
 function createModelResolver(api: TuiPluginApi, optionModel: string | undefined) {
-  // Once-per-process-per-source suppression lives in this closure: one
-  // registered instance per file is the documented setup.
+  // Once-per-process-per-source suppression lives in this closure, so the
+  // file must be registered exactly once (see README).
   const toastedSources = new Set<ModelSource>()
 
   // Read live at each call: the provider list populates after TUI startup and
@@ -157,39 +139,23 @@ function createModelResolver(api: TuiPluginApi, optionModel: string | undefined)
     api.ui.toast({
       variant: "error",
       title: RECAP_TITLE,
-      message: `Recap model "${raw}" from ${source} is invalid or unknown — falling back`,
+      message: `Recap model "${raw}" from ${source} is invalid or unknown — continuing without an explicit model`,
     })
   }
 
   // A level is skipped silently when unset; only a PRESENT bad value toasts.
-  const fromConfigValue = (
-    raw: string | undefined,
-    source: ModelSource,
-    notifyInvalid: boolean,
-  ): ModelRef | undefined => {
+  const fromConfigValue = (raw: string | undefined, source: ModelSource): ModelRef | undefined => {
     if (raw === undefined) return undefined
     const ref = parseModelRef(raw)
     if (!ref || !validate(ref)) {
-      if (notifyInvalid) toastInvalid(source, raw)
+      toastInvalid(source, raw)
       return undefined
     }
     return ref
   }
 
-  return (sessionID: string, notifyInvalid = true): ModelRef | undefined => {
-    const configured =
-      fromConfigValue(runtimeModelRaw(api), "runtime", notifyInvalid) ??
-      fromConfigValue(optionModel, "tui.json", notifyInvalid) ??
-      fromConfigValue(api.state.config.small_model, "small_model", notifyInvalid)
-    if (configured) return configured
-    const fromSession = sessionModelRef(api.state.session.messages(sessionID))
-    if (!fromSession) return undefined
-    if (!validate(fromSession)) {
-      if (notifyInvalid) toastInvalid("session", `${fromSession.providerID}/${fromSession.modelID}`)
-      return undefined
-    }
-    return fromSession
-  }
+  return (): ModelRef | undefined =>
+    fromConfigValue(optionModel, "tui.json") ?? fromConfigValue(api.state.config.small_model, "small_model")
 }
 
 function messageInfo(message: unknown): Record<string, unknown> {
@@ -217,71 +183,58 @@ function buildSyntaxStyle(api: TuiPluginApi): SyntaxStyle {
   })
 }
 
-function View(props: {
-  api: TuiPluginApi
-  session_id: string
-  staleAfter: number
-  onRecap: () => void
-  /** What the chain would resolve to now — shown and handed to the picker as `current`. */
-  currentModelRaw: () => string | undefined
-  onPickModel: () => void
-}) {
+function View(props: { api: TuiPluginApi; session_id: string; onAutoStart: () => void }) {
   const theme = () => props.api.theme.current
   // api.kv is a plain get/set store — keep a local signal for redraws and write through.
-  const [collapsed, setCollapsed] = createSignal(props.api.kv.get<boolean>(COLLAPSE_KEY, false) === true)
-  const toggleCollapsed = () => {
-    const next = !collapsed()
-    setCollapsed(next)
-    props.api.kv.set(COLLAPSE_KEY, next)
+  const [expanded, setExpanded] = createSignal(props.api.kv.get<boolean>(EXPANDED_KEY, true) !== false)
+  const toggleExpanded = () => {
+    const next = !expanded()
+    setExpanded(next)
+    props.api.kv.set(EXPANDED_KEY, next)
   }
   const record = () => sessionRecord(props.session_id)
+  // First render for a session queues its first automatic Recap — once per
+  // session per process. The run itself happens off-render; every later turn
+  // re-triggers via session.idle.
+  if (!record().autoQueued) {
+    record().autoQueued = true
+    queueMicrotask(() => props.onAutoStart())
+  }
   const recap = () => recapSignalOf(record())[0]()
   const loading = () => loadingSignalOf(record())[0]()
-
-  // Recap Staleness over reactive TUI state: own messages counted in a memo,
-  // compared with the snapshot taken when the last Recap succeeded. No event
-  // subscriptions; compaction/subagents/retries never move it.
-  const userCount = createMemo(() => countUserMessages(props.api.state.session.messages(props.session_id)))
-  const stale = createMemo(() => {
-    const baseline = baselineSignalOf(record())[0]()
-    return baseline !== null && isRecapStale(userCount(), baseline, props.staleAfter)
-  })
-  const messagesSinceRecap = () => {
-    const baseline = baselineSignalOf(record())[0]()
-    return baseline === null ? null : userCount() - baseline
-  }
   const syntaxStyle = () => buildSyntaxStyle(props.api)
+  // First turn still running: the auto-queued Recap is stuck behind the agent
+  // turn (generation only starts at session.idle), so "Generating…" would lie.
+  // While no Recap has ever completed and the session is not idle, show the
+  // waiting note instead. A mid-history session recapping while idle still
+  // shows "Generating…" — its generation really has started.
+  const hasCompletedRecap = () => record().anchor !== undefined || record().lastRecap !== undefined
+  const sessionNotIdle = () => {
+    try {
+      return props.api.state.session.status(props.session_id)?.type !== "idle"
+    } catch {
+      return true
+    }
+  }
+  const waitingForFirstTurn = () => loading() && !hasCompletedRecap() && sessionNotIdle()
 
   return (
     <box>
-      <box flexDirection="row" gap={1} onMouseDown={toggleCollapsed}>
-        <text fg={theme().text}>{collapsed() ? "▶" : "▼"}</text>
+      <box flexDirection="row" gap={1} onMouseDown={toggleExpanded}>
+        <text fg={theme().text}>{expanded() ? "▼" : "▶"}</text>
         <text fg={theme().text}>
           <b>{RECAP_TITLE}</b>
         </text>
       </box>
-      <Show when={!collapsed()}>
-        <text
-          fg={loading() ? theme().textMuted : theme().text}
-          attributes={TextAttributes.BOLD}
-          onMouseDown={() => {
-            if (!loading()) props.onRecap()
-          }}
-        >
-          {loading() ? "Generating…" : "Recap"}
-        </text>
-        {/* Runtime picker entry (ticket 05): click to open the DialogSelect. */}
-        <text fg={theme().textMuted} onMouseDown={props.onPickModel}>
-          {`Model: ${props.currentModelRaw() ?? "auto (session)"}`}
-        </text>
-        {/* Marked stale, not erased: an old Recap still orients. */}
-        <Show when={!loading() && recap() !== null && stale()}>
-          <text fg={theme().textMuted}>
-            {`stale — ${messagesSinceRecap()} messages since Recap (click to refresh)`}
-          </text>
+      <Show when={expanded()}>
+        <Show when={waitingForFirstTurn()}>
+          <text fg={theme().textMuted}>{WAITING_FOR_FIRST_TURN}</text>
+        </Show>
+        <Show when={loading() && !waitingForFirstTurn()}>
+          <text fg={theme().textMuted}>Generating…</text>
         </Show>
         <Show when={!loading() && recap() !== null}>
-          <markdown content={recap()!} syntaxStyle={syntaxStyle()} fg={theme().text} />
+          <markdown content={recap()!} syntaxStyle={syntaxStyle()} fg={theme().textMuted} />
         </Show>
       </Show>
     </box>
@@ -294,9 +247,6 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   const toast = (variant: "error" | "success" | "warning", message: string) =>
     api.ui.toast({ variant, title: RECAP_TITLE, message })
 
-  // Tuple options from tui.json: recognized keys typed here; unknown keys are
-  // ignored silently; a recognized key of the wrong type gets one toast and its
-  // default. No tui.json at all is a normal mode — all defaults.
   const recapOptions = parseRecapOptions(rawOptions)
   if (recapOptions.badKeys.length) {
     toast(
@@ -306,80 +256,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   }
   const resolveRecapModel = createModelResolver(api, recapOptions.model)
 
-  // Runtime pick (ticket 05): the chosen ref lives in api.kv under
-  // RECAP_MODEL_KV_KEY and survives restarts. api.kv itself is not reactive,
-  // so the sidebar explicitly tracks runtimeVersion — bumped by every
-  // pick/reset; reads stay LIVE for the resolver regardless.
-  const [runtimeVersion, bumpRuntimeVersion] = createSignal(0)
-  const setRuntimeModel = (raw: string | null): void => {
-    api.kv.set(RECAP_MODEL_KV_KEY, raw)
-    bumpRuntimeVersion((v) => v + 1)
-  }
-
-  // The line and DialogSelect `current` marker show the same validated model
-  // that the next Recap call will use. Previewing is side-effect-free so an
-  // invalid config does not toast merely because the sidebar rendered.
-  const currentModelRaw = (sessionID: string): string | undefined => {
-    runtimeVersion()
-    const ref = resolveRecapModel(sessionID, false)
-    return ref ? modelRefString(ref) : undefined
-  }
-
-  // The dialog opens synchronously DURING the opening mousedown, so the paired
-  // mouseup lands inside the fresh dialog — on an option row (ghost pick) or on
-  // the backdrop (dismiss). Ignore selections within GHOST_CLICK_MS of
-  // opening: a deliberate pick (Enter or a second click) always comes later.
-  const GHOST_CLICK_MS = 350
-  let pickerOpenedAt = 0
-
-  function openModelPicker(sessionID: string): void {
-    const options = modelPickerOptions(api.state.provider)
-    if (!options.length) {
-      toast("warning", "Provider list is not loaded yet — cannot pick a Recap Model")
-      return
-    }
-    api.ui.dialog.setSize("large")
-    pickerOpenedAt = Date.now()
-    api.ui.dialog.replace(() => (
-      <api.ui.DialogSelect<string>
-        title="Recap Model"
-        flat={false}
-        current={currentModelRaw(sessionID)}
-        options={[
-          {
-            title: PICK_RESET_TITLE,
-            value: PICK_RESET_VALUE,
-            description: "Clear the runtime choice — configuration chain applies again",
-            category: "Reset",
-          },
-          ...options,
-        ]}
-        onSelect={(option) => {
-          if (Date.now() - pickerOpenedAt < GHOST_CLICK_MS) return
-          if (option.value === PICK_RESET_VALUE) {
-            setRuntimeModel(null)
-            toast("success", "Recap model reset — following configuration")
-            api.ui.dialog.clear()
-            return
-          }
-
-          // Re-check the live provider map at selection time. The dialog may
-          // have stayed open while provider availability changed.
-          const ref = parseModelRef(option.value)
-          if (!ref || !isKnownModel(ref, api.state.provider)) {
-            toast("error", `Recap model "${option.value}" is no longer available`)
-            return
-          }
-          setRuntimeModel(option.value)
-          toast("success", `Recap model set to ${option.value}`)
-          api.ui.dialog.clear()
-        }}
-      />
-    ))
-  }
-
-  // Fetched ONCE at init and cached; core ids go into `tools` all-false.
-  // Probe finding: MCP tools are NOT in this list and need the "*" entry.
+  // MCP tools are NOT in this list — the "*" entry covers them.
   const toolIds = (((await client.tool.ids()).data as string[] | undefined) ?? [])
 
   function suppressAllTools(): Record<string, boolean> {
@@ -394,7 +271,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     inFlightControllers.set(sessionID, controller)
     let timedOut = false
 
-    // Spec order on timeout/shutdown: the Recap Session is asked to stop, and
+    // On timeout/shutdown the Recap Session is asked to stop first, and
     // deletion waits for that request to complete (enforced in the finally).
     // Idempotent: one abort POST per run no matter who triggers it.
     let stopRequest: Promise<unknown> | undefined
@@ -406,7 +283,6 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       return stopRequest
     }
 
-    // Linked to the plugin lifecycle: deactivation or TUI shutdown aborts the run.
     const onLifecycleAbort = () => controller.abort()
     api.lifecycle.signal.addEventListener("abort", onLifecycleAbort)
     const timer = setTimeout(() => {
@@ -416,10 +292,6 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     }, recapOptions.timeout_ms)
 
     try {
-      // Recap Digest from reactive TUI state: tool calls folded to one line
-      // each, reasoning dropped, long text cut visibly. Window is incremental —
-      // messages after the last successful Recap's anchor — and bounded by the
-      // configured budget with overflow dropped from the head.
       const entries = api.state.session.messages(sessionID).map((message) => ({
         info: messageInfo(message),
         parts: messageParts(api, message),
@@ -442,12 +314,13 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       const created = await client.session.create({ parentID: sessionID, title: "recap" })
       recapSessionID = created.data?.id
       if (!recapSessionID) throw new Error("Failed to create Recap Session")
+      recapChildIDs.add(recapSessionID)
 
       // One synchronous call; the answer carries ready parts — no session.idle,
       // no re-fetch, no prompt sniffing. Raced against the controller so a
-      // timeout or lifecycle shutdown ALWAYS releases the button even if the
+      // timeout or lifecycle shutdown ALWAYS releases the run even if the
       // transport hangs past the server-side abort.
-      const model = resolveRecapModel(sessionID)
+      const model = resolveRecapModel()
       const prompt = client.session.prompt({
         sessionID: recapSessionID,
         ...(model ? { model } : {}),
@@ -472,15 +345,12 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         .trim()
       if (!markdown) {
         // Empty reply: neither the anchor nor PREVIOUS RECAP may advance, so
-        // the next click retries the same window.
+        // the next turn retries the same window.
         recapSignalOf(record)[1]("_No Recap generated._")
         return
       }
       if (built.lastIncludedID !== undefined) record.anchor = built.lastIncludedID
       record.lastRecap = markdown
-      // Staleness snapshot taken NOW, on success, over reactive TUI state;
-      // failures above never moved it. A stale Recap is marked, not erased.
-      baselineSignalOf(record)[1](countUserMessages(api.state.session.messages(sessionID)))
       recapSignalOf(record)[1](markdown)
     } catch (err) {
       // Shutdown is not a Recap failure: deactivation/TUI exit aborts silently.
@@ -509,8 +379,6 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     }
   }
 
-  // Re-entrancy guard: five rapid clicks hand back ONE promise → one Recap
-  // Session created and deleted. The component's loading() check is cosmetic.
   function generateRecap(sessionID: string): Promise<void> {
     const running = inFlight.get(sessionID)
     if (running) return running
@@ -519,37 +387,41 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     return run
   }
 
-  // Bug 5 of the reference fixed: per-session state does not grow forever.
+  // Turn end: every main session re-recaps itself. Child sessions (our own
+  // throwaway Recap Sessions, subagents) idle too — never recap those. The
+  // parentID check covers children known to TUI state; the ID set covers our
+  // own children even if state has not synced them yet.
+  const offSessionIdle = api.event.on("session.idle", (event) => {
+    const sessionID = event.properties.sessionID
+    if (recapChildIDs.has(sessionID)) return
+    if (api.state.session.get(sessionID)?.parentID) return
+    void generateRecap(sessionID)
+  })
+  api.lifecycle.onDispose(offSessionIdle)
+
   const offSessionDeleted = api.event.on("session.deleted", (event) => {
     const sessionID = event.properties.info.id
     inFlightControllers.get(sessionID)?.abort()
     inFlightControllers.delete(sessionID)
     sessionRecords.delete(sessionID)
+    recapChildIDs.delete(sessionID)
   })
   api.lifecycle.onDispose(offSessionDeleted)
 
-  // Deactivation / TUI shutdown (US 25): subscriptions released, runs aborted,
-  // all state dropped.
   api.lifecycle.onDispose(() => {
     for (const controller of inFlightControllers.values()) controller.abort()
     inFlightControllers.clear()
     sessionRecords.clear()
+    recapChildIDs.clear()
   })
 
   api.slots.register({
-    order: 250,
+    // Last in the sidebar: internal sections sit at 100-500, token-usage at
+    // 150, goal at 550 — this stays below all of them.
+    order: 900,
     slots: {
       sidebar_content(_ctx, props) {
-        return (
-          <View
-            api={api}
-            session_id={props.session_id}
-            staleAfter={recapOptions.stale_after}
-            onRecap={() => generateRecap(props.session_id)}
-            currentModelRaw={() => currentModelRaw(props.session_id)}
-            onPickModel={() => openModelPicker(props.session_id)}
-          />
-        )
+        return <View api={api} session_id={props.session_id} onAutoStart={() => void generateRecap(props.session_id)} />
       },
     },
   })

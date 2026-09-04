@@ -1,10 +1,9 @@
 /**
- * Pure per-session Recap state: an LRU-bounded store plus the record shape.
  * No @opentui/* and no solid-js imports (signals are typed structurally), so
  * this file runs standalone under `node --test` away from the TUI.
  */
 
-/** Hard cap on sessions holding Recap state; the reference leaked 3 Maps forever. */
+/** Hard cap on sessions holding Recap state, so it can't grow without bound. */
 export const RECAP_SESSION_STATE_LIMIT = 64
 
 /**
@@ -18,11 +17,9 @@ export type RecapSessionRecord = {
   anchor: string | undefined
   /** Markdown of the last SUCCESSFUL Recap — the only source of PREVIOUS RECAP. */
   lastRecap: string | undefined
-  /** Own-message count when the last Recap succeeded (reactive); null = never succeeded. */
-  baseline: ValueSignal<number | null> | undefined
-  /** Sidebar text signal for the Recap Markdown itself. */
+  /** Set once the first automatic Recap has been queued — one per session. */
+  autoQueued: boolean
   recap: ValueSignal<string | null> | undefined
-  /** Sidebar busy flag for the Recap button. */
   loading: ValueSignal<boolean> | undefined
 }
 
@@ -30,15 +27,13 @@ export function createRecapRecord(): RecapSessionRecord {
   return {
     anchor: undefined,
     lastRecap: undefined,
-    baseline: undefined,
+    autoQueued: false,
     recap: undefined,
     loading: undefined,
   }
 }
 
 /**
- * Map with get-refreshed recency and a hard cap: inserting beyond the cap
- * evicts the least recently used entry. Reads touch recency.
  * Note: stored `undefined` values are indistinguishable from absence and do
  * not refresh recency — store a sentinel instead.
  */
@@ -58,7 +53,6 @@ export class LruMap<Key, Value> {
     return this.#entries.has(key)
   }
 
-  /** Read with a recency touch — the normal access path. */
   get(key: Key): Value | undefined {
     const value = this.#entries.get(key)
     if (value !== undefined) this.#touch(key, value)

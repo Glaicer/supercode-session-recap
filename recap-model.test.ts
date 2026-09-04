@@ -2,12 +2,9 @@ import assert from "node:assert/strict"
 import { describe, it } from "node:test"
 import {
   isKnownModel,
-  modelPickerOptions,
   modelRefString,
   parseModelRef,
   parseRecapOptions,
-  RECAP_MODEL_KV_KEY,
-  sessionModelRef,
 } from "./recap-model.ts"
 
 describe("parseModelRef", () => {
@@ -46,7 +43,6 @@ describe("parseRecapOptions", () => {
   it("returns defaults for undefined options (no tui.json is normal)", () => {
     assert.deepEqual(parseRecapOptions(undefined), {
       model: undefined,
-      stale_after: 3,
       budget: 12000,
       timeout_ms: 60000,
       badKeys: [],
@@ -58,20 +54,18 @@ describe("parseRecapOptions", () => {
       assert.equal(parsed.badKeys.length, 0, String(bad))
       assert.deepEqual(
         { ...parsed, badKeys: undefined },
-        { model: undefined, stale_after: 3, budget: 12000, timeout_ms: 60000, badKeys: undefined },
+        { model: undefined, budget: 12000, timeout_ms: 60000, badKeys: undefined },
       )
     }
   })
   it("reads recognized keys of correct type", () => {
     const parsed = parseRecapOptions({
       model: "gonka-proxy/deepseek-ai/deepseek-v4-flash-0731",
-      stale_after: 5,
       budget: 999,
       timeout_ms: 1234,
     })
     assert.deepEqual({ ...parsed, badKeys: [] }, {
       model: "gonka-proxy/deepseek-ai/deepseek-v4-flash-0731",
-      stale_after: 5,
       budget: 999,
       timeout_ms: 1234,
       badKeys: [],
@@ -80,54 +74,24 @@ describe("parseRecapOptions", () => {
   it("ignores unrecognized keys silently", () => {
     const parsed = parseRecapOptions({ whatever: "x", another: 1, nested: { a: 2 } })
     assert.deepEqual(parsed.badKeys, [])
-    assert.equal(parsed.stale_after, 3)
+    assert.equal(parsed.budget, 12000)
   })
   it("reports recognized keys of wrong type and keeps defaults", () => {
     const parsed = parseRecapOptions({
       model: 42,
-      stale_after: "many",
       budget: null,
       timeout_ms: {},
     })
-    assert.deepEqual(parsed.badKeys.sort(), ["budget", "model", "stale_after", "timeout_ms"])
+    assert.deepEqual(parsed.badKeys.sort(), ["budget", "model", "timeout_ms"])
     assert.equal(parsed.model, undefined)
-    assert.equal(parsed.stale_after, 3)
     assert.equal(parsed.budget, 12000)
     assert.equal(parsed.timeout_ms, 60000)
   })
   it("accepts partial options mixing valid and invalid keys", () => {
-    const parsed = parseRecapOptions({ budget: 500, stale_after: false })
+    const parsed = parseRecapOptions({ budget: 500, timeout_ms: false })
     assert.equal(parsed.budget, 500)
-    assert.equal(parsed.stale_after, 3)
-    assert.deepEqual(parsed.badKeys, ["stale_after"])
-  })
-})
-
-describe("sessionModelRef", () => {
-  const assistant = (providerID: string, modelID: string) => ({
-    info: { role: "assistant", providerID, modelID },
-  })
-  it("takes the LAST assistant message model", () => {
-    const messages = [
-      assistant("p1", "m1"),
-      { info: { role: "user" } },
-      assistant("p2", "m2"),
-    ]
-    assert.deepEqual(sessionModelRef(messages), { providerID: "p2", modelID: "m2" })
-  })
-  it("skips user and other roles", () => {
-    const messages = [{ info: { role: "user" } }, { info: {} }]
-    assert.equal(sessionModelRef(messages), undefined)
-  })
-  it("survives empty list and junk entries", () => {
-    assert.equal(sessionModelRef([]), undefined)
-    assert.equal(sessionModelRef([null, undefined, "junk", 42]), undefined)
-  })
-  it("reads flat messages too (no info wrapper)", () => {
-    assert.deepEqual(sessionModelRef([{ role: "assistant", providerID: "p", modelID: "m" }]), {
-      providerID: "p",
-      modelID: "m",
-    })
+    assert.equal(parsed.timeout_ms, 60000)
+    assert.deepEqual(parsed.badKeys, ["timeout_ms"])
   })
 })
 
@@ -150,10 +114,7 @@ describe("isKnownModel", () => {
   })
 })
 
-describe("RECAP_MODEL_KV_KEY / modelRefString", () => {
-  it("kv key is exactly recap.model (spec wording)", () => {
-    assert.equal(RECAP_MODEL_KV_KEY, "recap.model")
-  })
+describe("modelRefString", () => {
   it("round-trips through parseModelRef by the FIRST slash", () => {
     const raw = modelRefString({ providerID: "gonka-proxy", modelID: "deepseek-ai/deepseek-v4-flash-0731" })
     assert.equal(raw, "gonka-proxy/deepseek-ai/deepseek-v4-flash-0731")
@@ -161,82 +122,5 @@ describe("RECAP_MODEL_KV_KEY / modelRefString", () => {
       providerID: "gonka-proxy",
       modelID: "deepseek-ai/deepseek-v4-flash-0731",
     })
-  })
-})
-
-describe("modelPickerOptions", () => {
-  const providers = [
-    {
-      id: "opencode",
-      name: "OpenCode",
-      models: {
-        "nemotron-3.5-lightning-free": { id: "nemotron-3.5-lightning-free", name: "Nemotron 3.5 Lightning" },
-        "hy3-free": { id: "hy3-free", name: "" },
-      },
-    },
-    {
-      id: "gonka-proxy",
-      name: "Gonka Proxy",
-      models: { "deepseek-ai/deepseek-v4-flash-0731": { id: "x", name: "DeepSeek V4 Flash" } },
-    },
-    { id: "empty", name: "Empty Provider", models: {} },
-    { id: "no-models-field", name: "No Models" },
-    null,
-    "junk",
-  ]
-
-  it("flattens every known model into one option per entry, grouped by provider name", () => {
-    const options = modelPickerOptions(providers)
-    assert.deepEqual(options.map((o) => [o.category, o.title]), [
-      ["OpenCode", "Nemotron 3.5 Lightning"],
-      ["OpenCode", "hy3-free"],
-      ["Gonka Proxy", "DeepSeek V4 Flash"],
-    ])
-  })
-
-  it("values are raw provider/model-id strings that round-trip through parseModelRef", () => {
-    const options = modelPickerOptions(providers)
-    for (const option of options) {
-      const ref = parseModelRef(option.value)
-      assert.ok(ref, option.value)
-      const owner = providers.find(
-        (p) => p && typeof p === "object" && (p as { id?: string }).id === ref!.providerID,
-      )
-      assert.ok(owner, option.value)
-    }
-    assert.equal(options[0].value, "opencode/nemotron-3.5-lightning-free")
-    assert.equal(options[2].value, "gonka-proxy/deepseek-ai/deepseek-v4-flash-0731")
-  })
-
-  it("title prefers model.name and falls back to the raw modelID when name is missing or empty", () => {
-    const options = modelPickerOptions(providers)
-    assert.equal(options[0].title, "Nemotron 3.5 Lightning")
-    assert.equal(options[1].title, "hy3-free")
-  })
-
-  it("describes each option with its provider name", () => {
-    const options = modelPickerOptions(providers)
-    assert.equal(options[0].description, "OpenCode")
-    assert.equal(options[2].description, "Gonka Proxy")
-  })
-
-  it("skips providers without models without dying on junk entries", () => {
-    const options = modelPickerOptions(providers)
-    assert.equal(options.length, 3)
-    assert.equal(modelPickerOptions([]).length, 0)
-    assert.equal(modelPickerOptions([null, undefined, 42, "x"]).length, 0)
-  })
-
-  it("keeps provider order as given (api.state.provider order)", () => {
-    const flipped = [providers[1], providers[0]]
-    const options = modelPickerOptions(flipped)
-    assert.equal(options[0].category, "Gonka Proxy")
-  })
-
-  it("does not offer an empty model id that cannot pass model-ref validation", () => {
-    const options = modelPickerOptions([
-      { id: "provider", name: "Provider", models: { "": { name: "Broken" }, valid: {} } },
-    ])
-    assert.deepEqual(options.map((option) => option.value), ["provider/valid"])
   })
 })

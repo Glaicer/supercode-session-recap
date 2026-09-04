@@ -13,7 +13,6 @@ describe("LruMap", () => {
     const lru = new LruMap<string, number>(2)
     lru.set("a", 1)
     lru.set("b", 2)
-    // touching "a" makes "b" the oldest
     assert.equal(lru.get("a"), 1)
     lru.set("c", 3)
     assert.equal(lru.has("b"), false)
@@ -51,11 +50,11 @@ describe("LruMap", () => {
 })
 
 describe("createRecapRecord", () => {
-  it("starts with no anchor, no lastRecap and null staleness baseline", () => {
+  it("starts with no anchor, no lastRecap, nothing queued and no signals", () => {
     const record = createRecapRecord()
     assert.equal(record.anchor, undefined)
     assert.equal(record.lastRecap, undefined)
-    assert.equal(record.baseline, undefined)
+    assert.equal(record.autoQueued, false)
     assert.equal(record.recap, undefined)
     assert.equal(record.loading, undefined)
   })

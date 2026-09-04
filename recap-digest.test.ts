@@ -33,7 +33,7 @@ const toolError = (tool: string, input: Record<string, unknown>, error: string) 
 })
 
 describe("buildRecapDigest — tool calls", () => {
-  it("folds one line per completed call: name, short argument, ok (US 14)", () => {
+  it("folds one line per completed call: name, short argument, ok", () => {
     const built = buildRecapDigest([
       msg("m1", "user", [textPart("run the tests")]),
       msg("m2", "assistant", [toolCompleted("bash", { command: "npm test" })]),
@@ -57,7 +57,7 @@ describe("buildRecapDigest — tool calls", () => {
     assert.ok(built.digest.includes("-> error: Permission denied"), built.digest)
     assert.ok(!built.digest.includes("/usr/bin/bash"), built.digest)
   })
-  it("giant tool OUTPUT never enters the digest and budget still holds (US 15)", () => {
+  it("giant tool OUTPUT never enters the digest and budget still holds", () => {
     const messages = Array.from({ length: 50 }, (_, i) =>
       msg(`m${i}`, "assistant", [toolCompleted("bash", { command: `cmd ${i}` })]),
     )
@@ -126,8 +126,7 @@ const markerMsg = (i: number): DigestMessage =>
   msg(`m${i}`, "user", [textPart(`MARKER-${i} ${"b".repeat(60)}`)])
 
 describe("buildRecapDigest — budget window", () => {
-  it("overflow drops the HEAD of the window, tail survives; survivors are checkable (US 16)", () => {
-    // five ~70-char messages fit into a 200-char budget twice over
+  it("overflow drops the HEAD of the window, tail survives; survivors are checkable", () => {
     const built = buildRecapDigest(
       [markerMsg(1), markerMsg(2), markerMsg(3), markerMsg(4), markerMsg(5)],
       { budget: 160 },
@@ -166,7 +165,7 @@ describe("buildRecapDigest — budget window", () => {
   })
 })
 
-describe("buildRecapDigest — incremental window (US 17)", () => {
+describe("buildRecapDigest — incremental window", () => {
   it("takes only messages AFTER the anchored messageID", () => {
     const built = buildRecapDigest(
       [markerMsg(1), markerMsg(2), markerMsg(3)],
@@ -212,9 +211,10 @@ describe("buildRecapDigest — incremental window (US 17)", () => {
 })
 
 describe("buildRecapRequest", () => {
-  it("carries the section instructions and the digest block", () => {
+  it("instructs at most two plain sentences with no lists or sections", () => {
     const prompt = buildRecapRequest({ digest: "user: hello" })
-    assert.ok(prompt.includes("**Working on:**"))
+    assert.match(prompt, /at most two short sentences/)
+    assert.match(prompt, /no headings, no bullets, no lists/)
     assert.ok(prompt.includes("SESSION DIGEST:"))
     assert.ok(prompt.includes("user: hello"))
   })
