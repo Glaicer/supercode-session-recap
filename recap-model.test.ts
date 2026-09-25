@@ -1,10 +1,10 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
 import {
-  isKnownModel,
   modelRefString,
   parseModelRef,
   parseRecapOptions,
+  selectRecapModel,
 } from "./recap-model.ts"
 
 describe("parseModelRef", () => {
@@ -71,6 +71,10 @@ describe("parseRecapOptions", () => {
       badKeys: [],
     })
   })
+  it("treats a blank model option as no explicit model", () => {
+    assert.equal(parseRecapOptions({ model: "  " }).model, undefined)
+    assert.deepEqual(parseRecapOptions({ model: "" }).badKeys, [])
+  })
   it("ignores unrecognized keys silently", () => {
     const parsed = parseRecapOptions({ whatever: "x", another: 1, nested: { a: 2 } })
     assert.deepEqual(parsed.badKeys, [])
@@ -95,25 +99,6 @@ describe("parseRecapOptions", () => {
   })
 })
 
-describe("isKnownModel", () => {
-  const providers = [
-    { id: "gonka-proxy", models: { "deepseek-ai/deepseek-v4-flash-0731": {} } },
-    { id: "opencode", models: { nemotron: {} } },
-  ]
-  it("true when provider and model both exist", () => {
-    assert.equal(isKnownModel({ providerID: "opencode", modelID: "nemotron" }, providers), true)
-  })
-  it("false on unknown provider", () => {
-    assert.equal(isKnownModel({ providerID: "nope", modelID: "m" }, providers), false)
-  })
-  it("false on known provider with unknown model", () => {
-    assert.equal(isKnownModel({ providerID: "opencode", modelID: "ghost" }, providers), false)
-  })
-  it("false against an empty provider list", () => {
-    assert.equal(isKnownModel({ providerID: "opencode", modelID: "nemotron" }, []), false)
-  })
-})
-
 describe("modelRefString", () => {
   it("round-trips through parseModelRef by the FIRST slash", () => {
     const raw = modelRefString({ providerID: "gonka-proxy", modelID: "deepseek-ai/deepseek-v4-flash-0731" })
@@ -122,5 +107,51 @@ describe("modelRefString", () => {
       providerID: "gonka-proxy",
       modelID: "deepseek-ai/deepseek-v4-flash-0731",
     })
+  })
+})
+
+describe("selectRecapModel", () => {
+  const available = [
+    { providerID: "project", modelID: "main" },
+    { providerID: "project", modelID: "small" },
+    { providerID: "project", modelID: "team/namespaced" },
+  ]
+  const fallback = available[0]
+
+  it("uses the explicit model before the title agent model, preserving namespaced IDs", () => {
+    assert.deepEqual(selectRecapModel({
+      explicit: "project/team/namespaced", title: available[1], fallback, available,
+    }), { model: available[2], warnings: [] })
+  })
+
+  it("uses the configured title agent model and then the default", () => {
+    assert.deepEqual(selectRecapModel({ title: available[1], fallback, available }), {
+      model: available[1], warnings: [],
+    })
+    assert.deepEqual(selectRecapModel({ fallback, available }), { model: fallback, warnings: [] })
+  })
+
+  it("warns for each unavailable configured source and falls through", () => {
+    assert.deepEqual(selectRecapModel({
+      explicit: "missing/model", title: { providerID: "project", modelID: "gone" }, fallback, available,
+    }), {
+      model: fallback,
+      warnings: [
+        { source: "model", message: 'Recap option model "missing/model" is unavailable; trying the next model.' },
+        { source: "title", message: 'Title agent model "project/gone" is unavailable; trying the default model.' },
+      ],
+    })
+  })
+
+  it("warns for a malformed explicit reference and uses the title model", () => {
+    assert.deepEqual(selectRecapModel({ explicit: "bad", title: available[1], fallback, available }), {
+      model: available[1],
+      warnings: [{ source: "model", message: 'Recap option model "bad" must be provider/model-id; trying the next model.' }],
+    })
+  })
+
+  it("fails visibly when no available default remains", () => {
+    assert.throws(() => selectRecapModel({ available: [] }), /No available Recap model at this location/)
+    assert.throws(() => selectRecapModel({ fallback, available: [] }), /No available Recap model at this location/)
   })
 })

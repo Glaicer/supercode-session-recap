@@ -17,6 +17,12 @@ Restart OpenCode. The package exports a server plugin and a precompiled TUI plug
 
 The installed directory exports `index.js` and `tui.js` for V2 local plugin discovery. Once the V2 package is published, its package name can replace the local directory in `plugins`.
 
+## Recap Model
+
+Set `options.model` in the plugin entry to choose `provider/model-id`. Model IDs may contain more `/` characters. Without it, Recap uses the configured `agents.title.model` (including V1 `small_model` normalized by V2), then the available default model. An unavailable configured model produces one warning per source and location before falling back; an unavailable final default produces an error. The server checks models and generates within the completed session's location, so a project-only model can be selected there.
+
+`budget` defaults to `12000` characters. Unknown options are ignored. A recognized option with the wrong type uses its default and produces one warning.
+
 ## Development
 
 ```bash
@@ -25,9 +31,12 @@ npm run typecheck
 npm test
 npm pack
 node scripts/probe.mjs
+node scripts/probe-model-selection.mjs
 ```
 
-The probe requires OpenCode V2 2.0.16, Python 3 and Node 24. It installs the packed artifact in a temporary directory, starts an isolated OpenCode server and a controlled local model endpoint, opens a PTY TUI, and checks the location-scoped Recap, visible sidebar update, History, session count and tool-free generation. It does not publish the package or alter the active OpenCode configuration.
+The probe requires OpenCode V2 2.0.16, Python 3 and Node 24. It extracts the packed artifact in a temporary directory, starts an isolated OpenCode server and a controlled local model endpoint, opens a PTY TUI, and checks the location-scoped Recap, visible sidebar update, History, session count and tool-free generation. It does not publish the package or alter the active OpenCode configuration.
+
+The model-selection probe packs the artifact into an isolated temporary directory and checks location-scoped requests against the controlled endpoint: a global title model, a project-only title model, a V1 `small_model`, an explicit namespaced model that overrides the title model, and fallback after invalid options. It also verifies that generation does not create a session or send tools.
 
 ## Attribution
 

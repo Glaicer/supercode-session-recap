@@ -2,15 +2,12 @@
  * No @opentui/* imports, so this file runs standalone under `node --test`
  * (or bun test) away from the TUI.
  *
- * The Recap Model is OpenCode's `small_model` (the same one used for session
- * title generation), with an explicit `model` option from tui.json as the only
- * override. There is no runtime picker and no kv storage.
+ * The Recap Model comes from the plugin option, the configured title agent
+ * (including V1 small_model normalized by V2), or the location's default.
  */
 
 export type ModelRef = { providerID: string; modelID: string }
-
-/** Where a failed candidate came from — named verbatim in the error toast. */
-export type ModelSource = "tui.json" | "small_model"
+export type RecapWarning = { source: string; message: string }
 
 export function modelRefString(ref: ModelRef): string {
   return `${ref.providerID}/${ref.modelID}`
@@ -50,7 +47,7 @@ function isNumber(value: unknown): value is number {
 
 // Unknown keys are ignored silently; a recognized key of the wrong type lands
 // in badKeys (one toast) and falls back to its default. Anything can arrive in
-// the tuple — a non-object options bag just means "all defaults", never a crash.
+// the package options — a non-object bag means "all defaults", never a crash.
 export function parseRecapOptions(raw: unknown): ParsedRecapOptions {
   const bag = typeof raw === "object" && raw !== null && !Array.isArray(raw)
     ? (raw as Record<string, unknown>)
@@ -58,7 +55,7 @@ export function parseRecapOptions(raw: unknown): ParsedRecapOptions {
   const badKeys: string[] = []
   let model: string | undefined
   if (typeof bag.model === "string") {
-    model = bag.model
+    model = bag.model.trim() ? bag.model : undefined
   } else if (bag.model !== undefined) {
     badKeys.push("model")
   }
@@ -87,12 +84,27 @@ export function unwrapMessage(message: unknown): Record<string, unknown> | undef
   return info && typeof info === "object" ? info : undefined
 }
 
-// Validation against api.state.provider happens BEFORE the prompt call. An
-// empty provider list (state not loaded yet) validates nothing here — callers
-// decide whether to trust the ref rather than false-fail every level.
-export function isKnownModel(ref: ModelRef, providers: ReadonlyArray<unknown>): boolean {
-  return providers.some((p) => {
-    const provider = p as { id?: unknown; models?: Record<string, unknown> } | null | undefined
-    return provider?.id === ref.providerID && Boolean(provider.models?.[ref.modelID])
-  })
+export function selectRecapModel(input: {
+  explicit?: string
+  title?: ModelRef
+  fallback?: ModelRef
+  available: ReadonlyArray<ModelRef>
+}): { model: ModelRef; warnings: RecapWarning[] } {
+  const warnings: RecapWarning[] = []
+  const known = (ref: ModelRef) => input.available.some(
+    (model) => model.providerID === ref.providerID && model.modelID === ref.modelID,
+  )
+  if (input.explicit !== undefined) {
+    const ref = parseModelRef(input.explicit)
+    if (ref && known(ref)) return { model: ref, warnings }
+    warnings.push({ source: "model", message: ref
+      ? `Recap option model "${input.explicit}" is unavailable; trying the next model.`
+      : `Recap option model "${input.explicit}" must be provider/model-id; trying the next model.` })
+  }
+  if (input.title) {
+    if (known(input.title)) return { model: input.title, warnings }
+    warnings.push({ source: "title", message: `Title agent model "${modelRefString(input.title)}" is unavailable; trying the default model.` })
+  }
+  if (input.fallback && known(input.fallback)) return { model: input.fallback, warnings }
+  throw new Error(`No available Recap model at this location. ${warnings.map((item) => item.message).join(" ")}`.trim())
 }

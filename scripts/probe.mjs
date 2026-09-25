@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { spawn, execFileSync } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { createServer } from "node:http"
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readdir, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -33,9 +33,16 @@ await new Promise((ok) => mock.listen(0, "127.0.0.1", ok))
 const modelPort = mock.address().port
 await mkdir(project, { recursive: true })
 await mkdir(join(config, "opencode"), { recursive: true })
-const archive = join(root, "glaicer-supercode-session-recap-0.1.0.tgz")
-execFileSync("npm", ["install", "--ignore-scripts", "--prefix", temp, archive], { stdio: "pipe" })
+const install = join(temp, "install")
+await mkdir(install, { recursive: true })
+execFileSync("npm", ["pack", "--pack-destination", install], { cwd: root, stdio: "ignore" })
+const archives = (await readdir(install)).filter((name) => name.endsWith(".tgz"))
+assert.equal(archives.length, 1)
+const archive = join(install, archives[0])
 const installed = join(temp, "node_modules", "@glaicer", "supercode-session-recap")
+await mkdir(installed, { recursive: true })
+execFileSync("tar", ["-xzf", archive, "-C", installed, "--strip-components=1"], { stdio: "pipe" })
+await symlink(join(root, "node_modules"), join(installed, "node_modules"), "dir")
 const { default: tuiPlugin } = await import(pathToFileURL(join(installed, "tui.js")).href)
 let onSuccess
 let childCalls = 0
@@ -84,7 +91,7 @@ try {
   const output = await client.rpc(Recap).summarize({ prompt: "SESSION DIGEST:\nuser: Fix sidebar" }, { location })
   const plugins = await client.plugin.list({ location })
   assert(plugins.data.some((p) => p.id === "supercode.recap.server"), `${JSON.stringify(plugins)}\n${logs}`)
-  assert.deepEqual(output, { text: "Recap from project model." })
+  assert.deepEqual(output, { text: "Recap from project model.", warnings: [] })
   assert.equal(requests.length, 1)
   assert.equal(requests[0].model, "project-only")
   assert.equal(requests[0].tools, undefined)

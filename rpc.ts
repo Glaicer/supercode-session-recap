@@ -12,8 +12,19 @@ export const Recap = Rpc.define({
       },
       output: {
         type: "object",
-        properties: { text: { type: "string" } },
-        required: ["text"],
+        properties: {
+          text: { type: "string" },
+          warnings: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { source: { type: "string" }, message: { type: "string" } },
+              required: ["source", "message"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["text", "warnings"],
         additionalProperties: false,
       },
     },

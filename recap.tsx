@@ -12,6 +12,7 @@ export default Plugin.define({
     const recap = context.client.rpc(Recap)
     const [state, setState] = createSignal<Record<string, string>>({})
     const running = new Set<string>()
+    const warned = new Set<string>()
     let disposed = false
 
     const stop = context.data.on("session.execution.succeeded", (event) => {
@@ -25,7 +26,16 @@ export default Plugin.define({
           const { digest } = buildRecapDigest(context.data.session.message.list(sessionID), { budget: options.budget })
           if (!digest || disposed) return
           const location = session.location
-          const response = await recap.summarize({ prompt: buildRecapRequest({ digest }) }, { location }) as { text: string }
+          const response = await recap.summarize({ prompt: buildRecapRequest({ digest }) }, { location }) as {
+            text: string
+            warnings: Array<{ source: string; message: string }>
+          }
+          for (const warning of response.warnings) {
+            const key = `${location.directory}:${warning.source}`
+            if (warned.has(key) || disposed) continue
+            warned.add(key)
+            context.ui.toast.show({ title: "Recap", variant: "warning", message: warning.message })
+          }
           if (!disposed && response.text.trim()) setState((current) => ({ ...current, [sessionID]: response.text.trim() }))
         } catch (error) {
           if (!disposed) context.ui.toast.show({ title: "Recap", variant: "error", message: `Recap failed: ${String(error)}` })
