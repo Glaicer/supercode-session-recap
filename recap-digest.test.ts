@@ -97,6 +97,17 @@ describe("buildRecapDigest — file edits", () => {
 })
 
 describe("buildRecapDigest — text and reasoning", () => {
+  it("folds visible V2 user and assistant text without reasoning", () => {
+    const built = buildRecapDigest([
+      { id: "u1", type: "user", text: "Fix the sidebar" },
+      { id: "a1", type: "assistant", content: [
+        { type: "reasoning", text: "private thought" },
+        { type: "text", text: "The sidebar is fixed." },
+      ] },
+    ])
+    assert.equal(built.digest, "user: Fix the sidebar\nassistant: The sidebar is fixed.")
+    assert.equal(built.lastIncludedID, "a1")
+  })
   it("reasoning parts are dropped entirely", () => {
     const built = buildRecapDigest([
       msg("m1", "assistant", [{ type: "reasoning", text: "CLASSIFIED-THOUGHT" }, textPart("visible")]),

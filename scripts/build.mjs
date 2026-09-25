@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = resolve(root, "dist");
 // Tests stay out of dist.
-const sources = ["recap-model.ts", "recap-digest.ts", "recap-state.ts", "recap.tsx"];
+const sources = ["recap-model.ts", "recap-digest.ts", "recap-state.ts", "rpc.ts", "server.ts", "recap.tsx"];
 
 function rewriteTypeScriptExtensions() {
   const rewrite = (path) => {

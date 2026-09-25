@@ -21,10 +21,14 @@
     "session-recap"
   ],
   "exports": {
+    ".": "./dist/server.js",
+    "./rpc": "./dist/rpc.js",
     "./tui": "./dist/recap.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "index.js",
+    "tui.js"
   ],
   "publishConfig": {
     "access": "public"
@@ -37,21 +41,26 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode-ai/plugin": ">=1.18.21",
-    "@opentui/core": ">=0.4.5",
-    "@opentui/solid": ">=0.4.5",
-    "solid-js": "1.9.12"
+    "@opencode/plugin": "2.0.16"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.10",
+    "@opentui/solid": ">=0.5.10",
+    "solid-js": ">=1.9.0"
   },
   "devDependencies": {
     "@babel/core": "7.28.0",
     "@babel/preset-typescript": "7.27.1",
-    "@opencode-ai/sdk": "1.18.21",
+    "@opencode/client": "2.0.16",
+    "@opentui/core": "0.5.12",
+    "@opentui/solid": "0.5.12",
     "@types/node": "24.13.3",
     "babel-preset-solid": "1.9.12",
+    "solid-js": "1.9.12",
     "typescript": "5.8.2"
   },
   "engines": {
     "node": ">=24",
-    "opencode": ">=1.18.21"
+    "opencode": ">=2.0.0"
   }
 }

@@ -24,6 +24,10 @@ const TOOL_ARG_KEYS = [
 const FILE_EDIT_TOOLS = new Set(["edit", "write", "patch", "multiedit"])
 
 export type DigestMessage = {
+  id?: string
+  type?: string
+  text?: string
+  content?: ReadonlyArray<unknown>
   info?: unknown
   parts?: ReadonlyArray<unknown>
 }
@@ -109,10 +113,15 @@ function foldTextPart(part: Record<string, unknown>): string {
 function foldMessage(entry: DigestMessage): string {
   const info = unwrapMessage(entry)
   if (!info) return ""
-  const role = info.role
+  const role = info.role ?? info.type
   if (role !== "user" && role !== "assistant") return ""
   const lines: string[] = []
-  for (const part of Array.isArray(entry.parts) ? entry.parts : []) {
+  if (role === "user" && typeof info.text === "string") {
+    const text = foldTextPart({ text: info.text })
+    if (text) lines.push(text)
+  }
+  const parts = Array.isArray(entry.parts) ? entry.parts : Array.isArray(info.content) ? info.content : []
+  for (const part of parts) {
     const p = (part ?? {}) as Record<string, unknown>
     if (p.type === "text") {
       if (p.ignored === true) continue
