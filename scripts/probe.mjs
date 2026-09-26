@@ -35,7 +35,6 @@ const makeStorage = (directory) => ({
   },
 })
 
-
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)))
 const probeRoot = join(tmpdir(), "opencode")
 await mkdir(probeRoot, { recursive: true })
@@ -106,6 +105,17 @@ await mkdir(project, { recursive: true })
 await mkdir(noPlugin, { recursive: true })
 await writeFile(join(project, "README.md"), "Probe project fixture.\n")
 await mkdir(join(config, "opencode"), { recursive: true })
+// The global configuration carries a title model and its own provider but no
+// plugin entry: a location without a project config inherits the global Recap
+// Model chain, while the unavailable-RPC location keeps having no companion.
+await writeFile(join(config, "opencode", "opencode.json"), JSON.stringify({
+  model: "recap-probe-global/global-default",
+  agents: { title: { model: "recap-probe-global/global-title" } },
+  providers: { "recap-probe-global": { name: "Recap global", env: ["RECAP_PROBE_KEY"],
+    package: "@opencode/ai/providers/openai-compatible",
+    settings: { baseURL: `http://127.0.0.1:${modelPort}/v1` },
+    models: { "global-default": { name: "Global default" }, "global-title": { name: "Global title" } } } },
+}))
 const install = join(temp, "install")
 await mkdir(install, { recursive: true })
 execFileSync("npm", ["pack", "--pack-destination", install], { cwd: root, stdio: "ignore" })
@@ -140,6 +150,10 @@ assert.equal(childCalls, 0)
 disposeChild()
 await writeFile(join(project, "opencode.json"), JSON.stringify({
   model: "recap-probe/project-only",
+  // The project pins the title agent to the same project-only model, so the
+  // Recap Model chain still lands on project-only here while the global
+  // configuration stays free to drive other locations (see global-project).
+  agents: { title: { model: "recap-probe/project-only" } },
   plugins: [{ package: installed, options: { timeout_ms: 2000 } }],
   providers: { "recap-probe": { name: "Recap probe", env: ["RECAP_PROBE_KEY"],
     package: "@opencode/ai/providers/openai-compatible",
@@ -191,9 +205,9 @@ try {
   )
   assert.equal(requests.length, requestsBeforeUnavailable, "an unavailable RPC must not fall back to a model call")
   const session = await client.session.create({ location })
-  const startTui = () => {
+  const startTui = (sessionID = session.id, directory = project) => {
     const child = spawn("python3", [join(root, "scripts", "probe-pty.py"), "opencode", "--server",
-      `http://127.0.0.1:${port}`, "--session", session.id, project], { cwd: project, env, stdio: ["pipe", "pipe", "pipe"] })
+      `http://127.0.0.1:${port}`, "--session", sessionID, directory], { cwd: directory, env, stdio: ["pipe", "pipe", "pipe"] })
     child.stdout.on("data", recordScreen)
     child.stderr.on("data", recordScreen)
     return child
@@ -210,6 +224,10 @@ try {
   // What the user actually sees: escape sequences (including the SGR color
   // changes inside a markdown-rendered recap) stripped away.
   const visible = (frame) => frame.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
+  // Failure-path diagnostic: the whole last frame, for offline inspection.
+  const dumpFrame = (name) => {
+    try { writeFileSync(join("/tmp/opencode", name), screen) } catch {}
+  }
   const waitFor = async (value) => {
     for (let i = 0; i < 150; i++) {
       if (visible(screen).includes(value) || (value === "Tool work recap." && toolShown)) return
@@ -245,10 +263,23 @@ try {
       return
     }
     const failure = new Error(`TUI never repainted ${typeof value === "function" ? "the state" : value}: ${screen.slice(-6000)}`)
-    // Diagnostic escape hatch: the whole last frame, for offline inspection.
-    const { writeFileSync: dumpFrame } = await import("node:fs")
-    try { dumpFrame("/tmp/opencode/probe-screen.bin", screen) } catch {}
+    dumpFrame("probe-screen.bin")
     throw failure
+  }
+  // Absence needs a settled frame: a partial repaint would briefly hide
+  // anything. Resize, let the frame finish, then check.
+  let goneRound = 0
+  const waitUntilGone = async (check) => {
+    const deadline = Date.now() + 60_000
+    while (Date.now() < deadline) {
+      screen = ""
+      tui.stdin.write(`resize ${goneRound++ % 2 ? 50 : 49} 220\n`)
+      await sleep(1500)
+      if (tui.exitCode !== null) throw new Error("TUI exited while waiting for clearance")
+      if (!check(screen)) return
+    }
+    dumpFrame("probe-cleared.bin")
+    throw new Error(`TUI never cleared the expected state: ${screen.slice(-3000)}`)
   }
   // Full-repaint frames are positioned text: split one into (row, col, text)
   // runs so the probe can locate sidebar UI — and its colors — in the stream.
@@ -410,10 +441,7 @@ try {
     // --- sidebar: collapse, persisted choice, restart, waiting state ---
     await waitForRepaint("Tool work recap.")
     const header = recapHeader(screen)
-    if (!header || header.arrow !== "▼") {
-      const { writeFileSync: dumpFrame } = await import("node:fs")
-      dumpFrame("/tmp/opencode/probe-header.bin", screen)
-    }
+    if (!header || header.arrow !== "▼") dumpFrame("probe-header.bin")
     assert(header, `the sidebar must paint the Recap header: ${screen.slice(-1200)}`)
     assert.equal(header.arrow, "▼", `an untouched section starts expanded: ${JSON.stringify(header)}`)
     tui.stdin.write(`mouse ${header.col} ${header.row}\n`)
@@ -438,6 +466,16 @@ try {
     tui.stdin.write(`mouse ${restarted.col} ${restarted.row}\n`)
     await waitForRepaint((frame) => recapHeader(frame)?.arrow === "▼")
     await waitFor("Recap appears after the session's")
+    // Hot disable: removing the package entry must tear the live section down
+    // through the host's own reconcile, and restoring it must bring the
+    // section back as a fresh generation.
+    const configPath = join(project, "opencode.json")
+    const withPlugin = readFileSync(configPath, "utf8")
+    await writeFile(configPath, JSON.stringify({ ...JSON.parse(withPlugin), plugins: [] }))
+    await waitUntilGone((frame) => recapHeader(frame) !== undefined)
+    await writeFile(configPath, withPlugin)
+    await waitForRepaint((frame) => recapHeader(frame) !== undefined)
+    await waitFor("Recap appears after the session's")
     // In-flight deletion through the live host: the release must not wait for
     // the timeout, the late answer must be discarded and no failure reported.
     const deletionDigest = digestRequests().length + 1
@@ -450,6 +488,23 @@ try {
     await sleep(3500)
     assert(!screen.includes("Fifth recap text"), "a deleted session's late answer must not surface")
     assert(!screen.includes("timed out"), "deleting a session must release the wait without a timeout toast")
+    // A global title model must drive the Recap through the same live TUI path
+    // for a location that configures no model of its own.
+    tui.kill()
+    await new Promise((resolve) => { tui.once("exit", resolve); tui.once("error", resolve) })
+    const globalProject = join(temp, "global-project")
+    await mkdir(globalProject, { recursive: true })
+    await writeFile(join(globalProject, "opencode.json"), JSON.stringify({
+      plugins: [{ package: installed, options: {} }],
+    }))
+    const globalSession = await client.session.create({ location: { directory: globalProject } })
+    screen = ""
+    tui = startTui(globalSession.id, globalProject)
+    await waitFor("Recap")
+    await client.session.prompt({ sessionID: globalSession.id, text: "Global model check", location: { directory: globalProject } })
+    for (let i = 0; i < 25 && digestRequests().length < 6; i++) await sleep(200)
+    assert.equal(digestRequests().at(-1).model, "global-title", JSON.stringify(digestRequests().at(-1)).slice(-400))
+    await waitForRepaint("Recap text 6")
   } finally {
     tui.kill()
   }
@@ -599,7 +654,7 @@ try {
     })
     return { state, dispose }
   }
-  const lifecycle = makeLifecycleHarness(undefined, "lifecycle")
+  const lifecycle = makeLifecycleHarness()
   const a = { id: "root-a", location }
   const b = { id: "root-b", location: { directory: join(project, "elsewhere") } }
   lifecycle.state.sessions.set(a.id, a)
@@ -745,6 +800,7 @@ try {
     sessions: 2, childIgnored: true, historyMessages, providerRequests: requests.length, sidebarUpdated: true,
     waitingStateShown: true, markdownConcealed: true, narrowTerminalReadable: true, themeSwitchRecolored: true,
     collapseClickWorked: true, choicePersistedAcrossRestart: true, recapTextNotPersisted: true,
+    hotDisableRemovedSection: true, hotEnableRestoredSection: true, globalModelDroveRecap: true,
     indicatorClearedOnSuccess: true, indicatorClearedOnTimeout: true, timedOutWindowRetried: true, lateAnswerDiscarded: true,
     liveDeletionReleasedWait: true, unavailableRpcRejected: true, deletionClearedState: true, timeoutEndedLocalWait: true,
     reentrySingleGeneration: true, sessionIsolation: true, settingsLocationRouted: true, settingsCachePerLocation: true,
