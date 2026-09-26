@@ -1,33 +1,13 @@
-/**
- * No @opentui/* and no solid-js imports (signals are typed structurally), so
- * this file runs standalone under `node --test` away from the TUI.
- */
+/** No @opentui/* and no solid-js imports, so this file runs standalone under `node --test` away from the TUI. */
 
 /** Hard cap on sessions holding Recap state, so it can't grow without bound. */
 export const RECAP_SESSION_STATE_LIMIT = 64
 
-/**
- * Structural stand-in for solid's `[accessor, setter]` tuple — keeps this
- * module import-free while recap.tsx stores real createSignal tuples here.
- */
-export type ValueSignal<T> = [get: () => T, set: (value: T) => T]
-
-export type RecapSessionRecord = {
-  /** messageID covered by the last SUCCESSFUL Recap — next Digest starts after it. */
-  anchor: string | undefined
+export type RecapSessionState = {
   /** Markdown of the last SUCCESSFUL Recap — the only source of PREVIOUS RECAP. */
-  lastRecap: string | undefined
-  recap: ValueSignal<string | null> | undefined
-  loading: ValueSignal<boolean> | undefined
-}
-
-export function createRecapRecord(): RecapSessionRecord {
-  return {
-    anchor: undefined,
-    lastRecap: undefined,
-    recap: undefined,
-    loading: undefined,
-  }
+  text: string
+  /** messageID covered by that Recap — the next Digest folds only what came after it. */
+  anchor: string | undefined
 }
 
 /**

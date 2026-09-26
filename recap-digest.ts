@@ -7,7 +7,7 @@ export { DIGEST_DEFAULT_BUDGET }
 // messages and still guarantee the final digest never exceeds the budget.
 const TEXT_PART_LIMIT = 400
 const TOOL_ARG_LIMIT = 80
-const TOOL_ERROR_LIMIT = 160
+const TOOL_OUTCOME_LIMIT = 160
 
 // First matching key wins: path-like inputs identify read/glob/edit calls,
 // command identifies bash, pattern identifies grep/glob.
@@ -80,11 +80,25 @@ function changeSign(tool: string, metadata: Record<string, unknown> | undefined)
   return tool === "write" ? "(+)" : "(~)"
 }
 
+// Brief result for completed calls: the first line of the first text content.
+// Voluminous tool output never enters the digest beyond that line.
+function firstTextLine(content: unknown): string {
+  if (!Array.isArray(content)) return ""
+  for (const item of content) {
+    const part = (item ?? {}) as Record<string, unknown>
+    if (part.type === "text" && typeof part.text === "string") {
+      return part.text.split("\n")[0]?.trim() ?? ""
+    }
+  }
+  return ""
+}
+
 function foldToolPart(part: Record<string, unknown>): string {
   const state = (part.state ?? {}) as {
     status?: unknown
     input?: Record<string, unknown>
     error?: unknown
+    content?: unknown
     metadata?: unknown
   }
   const name = typeof part.name === "string" && part.name ? part.name
@@ -94,12 +108,13 @@ function foldToolPart(part: Record<string, unknown>): string {
   const sign = FILE_EDIT_TOOLS.has(name) ? " " + changeSign(name, state.metadata as Record<string, unknown> | undefined) : ""
   let outcome: string
   if (state.status === "completed") {
-    outcome = "ok"
+    const result = shorten(firstTextLine(state.content), TOOL_OUTCOME_LIMIT)
+    outcome = result ? `ok: ${result}` : "ok"
   } else if (state.status === "error") {
     const error = state.error && typeof state.error === "object" && "message" in state.error
       ? state.error.message : state.error
     const firstLine = (typeof error === "string" ? error : "").split("\n")[0] ?? ""
-    outcome = `error: ${shorten(firstLine, TOOL_ERROR_LIMIT)}`
+    outcome = `error: ${shorten(firstLine, TOOL_OUTCOME_LIMIT)}`
   } else {
     outcome = String(state.status ?? "unknown")
   }
@@ -149,9 +164,16 @@ function foldMessage(entry: DigestMessage): string {
 
 export function buildRecapDigest(
   messages: ReadonlyArray<DigestMessage>,
-  opts: { budget?: number; afterMessageID?: string } = {},
+  opts: { budget?: number; afterMessageID?: string; previousRecap?: string | null } = {},
 ): DigestBuild {
   const budget = opts.budget ?? DIGEST_DEFAULT_BUDGET
+
+  // The previous Recap shares the budget: reserve up to a quarter of it so the
+  // request can still carry the previous Recap beside the fresh digest.
+  const reserved = opts.previousRecap
+    ? Math.min(opts.previousRecap.length, Math.floor(budget / 4))
+    : 0
+  const windowBudget = budget - reserved
 
   // Incremental window: everything AFTER the anchored message. An anchor no
   // longer present in the list (compacted away, refetched) means the tail
@@ -175,7 +197,7 @@ export function buildRecapDigest(
   let truncated = false
   for (let i = folded.length - 1; i >= 0; i--) {
     const cost = folded[i].length + (keptReversed.length > 0 ? 1 : 0)
-    if (total + cost > budget) {
+    if (total + cost > windowBudget) {
       truncated = true
       break
     }
@@ -188,7 +210,7 @@ export function buildRecapDigest(
   // zero whole messages fitting must not produce an empty digest.
   if (!kept.length && folded.length > 0) {
     const last = folded[folded.length - 1]
-    kept.push(last.slice(Math.max(0, last.length - budget)))
+    kept.push(last.slice(Math.max(0, last.length - windowBudget)))
     truncated = true
   }
   if (kept.some((text) => text.includes("[…text truncated"))) truncated = true

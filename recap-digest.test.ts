@@ -18,11 +18,12 @@ const toolCompleted = (
   tool: string,
   input: Record<string, unknown>,
   metadata: Record<string, unknown> = {},
+  result = "done",
 ) => ({
   type: "tool",
   callID: "call-1",
   tool,
-  state: { status: "completed", input, output: "x".repeat(5000), title: "t", metadata },
+  state: { status: "completed", input, content: [{ type: "text", text: result }], metadata },
 })
 
 const toolError = (tool: string, input: Record<string, unknown>, error: string) => ({
@@ -33,33 +34,33 @@ const toolError = (tool: string, input: Record<string, unknown>, error: string) 
 })
 
 describe("buildRecapDigest — tool calls", () => {
-  it("folds V2 tool-only work using name and structured error without leaking content", () => {
+  it("folds V2 tool-only work using name, structured error and a brief result", () => {
     const built = buildRecapDigest([
       { id: "a1", type: "assistant", content: [
         { type: "reasoning", text: "SECRET-REASONING" },
         { type: "tool", id: "call-1", name: "bash", state: {
-          status: "completed", input: { command: "npm test" }, content: [{ type: "text", text: "SECRET-OUTPUT" }],
+          status: "completed", input: { command: "npm test" }, content: [{ type: "text", text: "47 tests passed\nSECRET-BULK-OUTPUT" }],
         } },
         { type: "tool", id: "call-2", name: "read", state: {
           status: "error", input: { filePath: "missing.ts" }, error: { type: "not_found", message: "File not found" },
         } },
       ] },
     ])
-    assert.equal(built.digest, "assistant: [tool] bash npm test -> ok\n[tool] read missing.ts -> error: File not found")
+    assert.equal(built.digest, "assistant: [tool] bash npm test -> ok: 47 tests passed\n[tool] read missing.ts -> error: File not found")
     assert.ok(!built.digest.includes("SECRET"))
   })
-  it("folds one line per completed call: name, short argument, ok", () => {
+  it("folds one line per completed call: name, short argument, brief result", () => {
     const built = buildRecapDigest([
       msg("m1", "user", [textPart("run the tests")]),
       msg("m2", "assistant", [toolCompleted("bash", { command: "npm test" })]),
     ])
-    assert.ok(built.digest.includes("[tool] bash npm test -> ok"), built.digest)
+    assert.ok(built.digest.includes("[tool] bash npm test -> ok: done"), built.digest)
   })
   it("picks a path-like argument when present", () => {
     const built = buildRecapDigest([
       msg("m1", "assistant", [toolCompleted("read", { filePath: "src/app.ts" })]),
     ])
-    assert.ok(built.digest.includes("[tool] read src/app.ts -> ok"), built.digest)
+    assert.ok(built.digest.includes("[tool] read src/app.ts -> ok: done"), built.digest)
   })
   it("error outcome carries only the FIRST line of the error", () => {
     const built = buildRecapDigest([
@@ -72,13 +73,14 @@ describe("buildRecapDigest — tool calls", () => {
     assert.ok(built.digest.includes("-> error: Permission denied"), built.digest)
     assert.ok(!built.digest.includes("/usr/bin/bash"), built.digest)
   })
-  it("giant tool OUTPUT never enters the digest and budget still holds", () => {
+  it("giant tool output enters only as its first line and budget still holds", () => {
     const messages = Array.from({ length: 50 }, (_, i) =>
-      msg(`m${i}`, "assistant", [toolCompleted("bash", { command: `cmd ${i}` })]),
+      msg(`m${i}`, "assistant", [toolCompleted("bash", { command: `cmd ${i}` }, {}, `ok ${i}\n${"x".repeat(5000)}`)]),
     )
     const built = buildRecapDigest(messages, { budget: DIGEST_DEFAULT_BUDGET })
     assert.ok(built.digest.length <= DIGEST_DEFAULT_BUDGET, String(built.digest.length))
     assert.ok(built.digest.length > 0)
+    assert.ok(built.digest.includes("ok 49"), built.digest)
     assert.ok(!built.digest.includes("xxxxx"), "raw tool output leaked")
   })
 })
@@ -213,6 +215,13 @@ describe("buildRecapDigest — budget window", () => {
     const built = buildRecapDigest(messages)
     assert.ok(built.truncated)
     assert.ok(built.digest.length <= 12000, String(built.digest.length))
+  })
+  it("reserves up to a quarter of the budget for the previous Recap", () => {
+    const messages = [markerMsg(1), markerMsg(2), markerMsg(3)]
+    const withPrevious = buildRecapDigest(messages, { budget: 160, previousRecap: "p".repeat(200) })
+    const withoutPrevious = buildRecapDigest(messages, { budget: 160 })
+    assert.ok(withPrevious.digest.length <= 120, String(withPrevious.digest.length))
+    assert.ok(withoutPrevious.digest.length > withPrevious.digest.length)
   })
 })
 

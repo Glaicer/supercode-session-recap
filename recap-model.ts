@@ -7,7 +7,9 @@
  */
 
 export type ModelRef = { providerID: string; modelID: string }
-export type RecapWarning = { source: string; message: string }
+export type RecapOptionKey = keyof RecapOptions
+export type RecapWarningSource = RecapOptionKey | "title"
+export type RecapWarning = { source: RecapWarningSource; message: string }
 
 export function modelRefString(ref: ModelRef): string {
   return `${ref.providerID}/${ref.modelID}`
@@ -29,7 +31,7 @@ export type RecapOptions = {
 
 export type ParsedRecapOptions = RecapOptions & {
   /** Recognized keys whose value had the wrong type; defaulted + toasted once. */
-  badKeys: string[]
+  badKeys: RecapOptionKey[]
 }
 
 // Strictly by the FIRST slash: gonka-proxy/deepseek-ai/deepseek-v4-flash-0731
@@ -45,17 +47,14 @@ function isNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value)
 }
 
-// Unknown keys are ignored silently; a recognized key of the wrong type lands
-// in badKeys (one toast) and falls back to its default. Anything can arrive in
-// the package options — a non-object bag means "all defaults", never a crash.
 export function parseRecapOptions(raw: unknown): ParsedRecapOptions {
   const bag = typeof raw === "object" && raw !== null && !Array.isArray(raw)
     ? (raw as Record<string, unknown>)
     : {}
-  const badKeys: string[] = []
+  const badKeys: RecapOptionKey[] = []
   let model: string | undefined
   if (typeof bag.model === "string") {
-    model = bag.model.trim() ? bag.model : undefined
+    model = bag.model.trim() || undefined
   } else if (bag.model !== undefined) {
     badKeys.push("model")
   }

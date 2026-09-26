@@ -1,4 +1,7 @@
 import { Rpc } from "@opencode/plugin/rpc"
+import type { RecapWarning } from "./recap-model.ts"
+
+export type RecapSummarizeOutput = { text: string; warnings: RecapWarning[] }
 
 export const Recap = Rpc.define({
   id: "supercode.recap",

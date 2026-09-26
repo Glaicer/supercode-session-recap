@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@glaicer/supercode-session-recap",
-  "version": "0.1.0",
-  "description": "OpenCode TUI sidebar section: Recap the current session into Working on / Done / Next.",
+  "version": "0.2.0",
+  "description": "OpenCode V2 plugin that shows a short Recap of a completed root session in the TUI sidebar without writing it to History.",
   "type": "module",
   "license": "MIT",
   "author": "Dmitrii Aronov <aronov.mml@gmail.com>",

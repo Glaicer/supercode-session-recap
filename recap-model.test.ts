@@ -75,6 +75,11 @@ describe("parseRecapOptions", () => {
     assert.equal(parseRecapOptions({ model: "  " }).model, undefined)
     assert.deepEqual(parseRecapOptions({ model: "" }).badKeys, [])
   })
+  it("trims the configured model so padding never reaches parsing", () => {
+    const parsed = parseRecapOptions({ model: " p/m " })
+    assert.equal(parsed.model, "p/m")
+    assert.deepEqual(parseModelRef(parsed.model), { providerID: "p", modelID: "m" })
+  })
   it("ignores unrecognized keys silently", () => {
     const parsed = parseRecapOptions({ whatever: "x", another: 1, nested: { a: 2 } })
     assert.deepEqual(parsed.badKeys, [])

@@ -1,19 +1,27 @@
 /** @jsxImportSource @opentui/solid */
 import { createSignal, Show } from "solid-js"
 import { Plugin } from "@opencode/plugin/tui"
-import { Recap } from "./rpc.ts"
+import { Recap, type RecapSummarizeOutput } from "./rpc.ts"
 import { buildRecapDigest, buildRecapRequest } from "./recap-digest.ts"
-import { parseRecapOptions } from "./recap-model.ts"
+import { parseRecapOptions, type RecapWarningSource } from "./recap-model.ts"
+import { LruMap, RECAP_SESSION_STATE_LIMIT, type RecapSessionState } from "./recap-state.ts"
 
 export default Plugin.define({
   id: "supercode.recap.tui",
   setup(context) {
     const options = parseRecapOptions(context.options)
+    const timeoutMs = Math.max(1, options.timeout_ms)
     const recap = context.client.rpc(Recap)
-    const [state, setState] = createSignal<Record<string, { text: string; anchor?: string }>>({})
+    const recaps = new LruMap<string, RecapSessionState>(RECAP_SESSION_STATE_LIMIT)
+    const warned = new LruMap<string, Set<RecapWarningSource>>(RECAP_SESSION_STATE_LIMIT)
+    const [revision, setRevision] = createSignal(0)
     const running = new Set<string>()
-    const warned = new Set<string>()
     let disposed = false
+
+    const recapOf = (sessionID: string) => {
+      revision()
+      return recaps.get(sessionID)
+    }
 
     const stop = context.data.on("session.execution.succeeded", (event) => {
       const sessionID = event.data.sessionID
@@ -21,27 +29,36 @@ export default Plugin.define({
       if (!session || session.parentID || running.has(sessionID)) return
       running.add(sessionID)
       void (async () => {
+        const controller = new AbortController()
+        let timer: ReturnType<typeof setTimeout> | undefined
         try {
           await context.data.session.message.sync(sessionID)
-          const previous = state()[sessionID]
+          const previous = recaps.get(sessionID)
           const budget = Math.max(1, Math.floor(options.budget))
-          const reserved = previous?.text ? Math.min(previous.text.length, Math.floor(budget / 4)) : 0
           const { digest, truncated, lastIncludedID } = buildRecapDigest(context.data.session.message.list(sessionID), {
-            budget: budget - reserved,
+            budget,
             afterMessageID: previous?.anchor,
+            previousRecap: previous?.text,
           })
           if (!digest || disposed) return
           const location = session.location
-          const response = await recap.summarize({ prompt: buildRecapRequest({
-            digest, truncated, previousRecap: previous?.text, budget,
-          }) }, { location }) as {
-            text: string
-            warnings: Array<{ source: string; message: string }>
-          }
+          const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              controller.abort()
+              reject(new Error("Recap timed out"))
+            }, timeoutMs)
+          })
+          const response = await Promise.race([
+            recap.summarize({ prompt: buildRecapRequest({
+              digest, truncated, previousRecap: previous?.text, budget,
+            }) }, { location, signal: controller.signal }),
+            timeout,
+          ]) as RecapSummarizeOutput
           for (const warning of response.warnings) {
-            const key = `${location.directory}:${warning.source}`
-            if (warned.has(key) || disposed) continue
-            warned.add(key)
+            const sources = warned.get(location.directory) ?? new Set<RecapWarningSource>()
+            if (sources.has(warning.source) || disposed) continue
+            sources.add(warning.source)
+            warned.set(location.directory, sources)
             context.ui.toast.show({ title: "Recap", variant: "warning", message: warning.message })
           }
           if (disposed) return
@@ -49,18 +66,31 @@ export default Plugin.define({
             context.ui.toast.show({ title: "Recap", variant: "error", message: "Recap failed: empty response" })
             return
           }
-          setState((current) => ({
-            ...current, [sessionID]: { text: response.text.trim(), anchor: lastIncludedID },
-          }))
+          if (!context.data.session.get(sessionID)) return
+          recaps.set(sessionID, { text: response.text.trim(), anchor: lastIncludedID })
+          setRevision((value) => value + 1)
         } catch (error) {
-          if (!disposed) context.ui.toast.show({ title: "Recap", variant: "error", message: `Recap failed: ${String(error)}` })
+          if (disposed) return
+          context.ui.toast.show({
+            title: "Recap",
+            variant: "error",
+            message: controller.signal.aborted
+              ? `Recap failed: timed out after ${timeoutMs}ms`
+              : `Recap failed: ${String(error)}`,
+          })
         } finally {
+          clearTimeout(timer)
           running.delete(sessionID)
         }
       })()
     })
 
-    const slot = context.ui.slot({
+    const stopDeleted = context.data.on("session.deleted", (event) => {
+      recaps.delete(event.data.sessionID)
+      setRevision((value) => value + 1)
+    })
+
+    const removeSlot = context.ui.slot({
       append: "sidebar.content",
       render: ({ sessionID }) => {
         const [expanded, setExpanded] = createSignal(true)
@@ -70,8 +100,8 @@ export default Plugin.define({
               <text fg={context.theme.text.base}>{expanded() ? "▼" : "▶"}</text>
               <text fg={context.theme.text.base}><b>Recap</b></text>
             </box>
-            <Show when={expanded() && state()[sessionID]}>
-              <text fg={context.theme.text.muted}>{state()[sessionID].text}</text>
+            <Show when={expanded() && recapOf(sessionID)}>
+              <text fg={context.theme.text.muted}>{recapOf(sessionID)?.text}</text>
             </Show>
           </box>
         )
@@ -80,7 +110,8 @@ export default Plugin.define({
     return () => {
       disposed = true
       stop()
-      slot()
+      stopDeleted()
+      removeSlot()
     }
   },
 })

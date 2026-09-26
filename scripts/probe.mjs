@@ -68,7 +68,7 @@ const disposeChild = tuiPlugin.setup({
   options: {},
   client: { rpc: () => ({ summarize: () => { childCalls++; return { text: "unexpected" } } }) },
   data: {
-    on: (_type, handler) => { onSuccess = handler; return () => {} },
+    on: (type, handler) => { if (type === "session.execution.succeeded") onSuccess = handler; return () => {} },
     session: { get: () => ({ id: "child", parentID: "root" }) },
   },
   ui: { slot: () => () => {} },
@@ -178,7 +178,7 @@ try {
     const toolHistory = [
       { id: "m1", type: "user", text: "Check the tests" },
       { id: "m2", type: "assistant", content: [{ type: "tool", name: "bash", state: {
-        status: "completed", input: { command: "npm test" }, content: [{ type: "text", text: "large private output" }],
+        status: "completed", input: { command: "npm test" }, content: [{ type: "text", text: "47 tests passed\nlarge private output" }],
       } }], snapshot: { files: ["src/app.ts"] } },
     ]
     let completed
@@ -187,6 +187,7 @@ try {
     let calls = 0
     const toasts = []
     let onDigestSuccess
+    let onDeleted
     const stopDigest = tuiPlugin.setup({
       options: { budget: 160 },
       client: { rpc: () => ({ summarize: async (input, options) => {
@@ -199,7 +200,11 @@ try {
         } finally { completed() }
       } }) },
       data: {
-        on: (_type, handler) => { onDigestSuccess = handler; return () => {} },
+        on: (type, handler) => {
+          if (type === "session.execution.succeeded") onDigestSuccess = handler
+          if (type === "session.deleted") onDeleted = handler
+          return () => {}
+        },
         session: {
           get: () => ({ id: session.id, location }),
           message: { sync: async () => {}, list: () => toolHistory },
@@ -221,7 +226,7 @@ try {
     try {
       await triggerDigest()
       const toolRequest = JSON.stringify(requests.at(-1))
-      assert(toolRequest.includes("[tool] bash npm test -> ok"), toolRequest)
+      assert(toolRequest.includes("[tool] bash npm test -> ok: 47 tests passed"), toolRequest)
       assert(toolRequest.includes("[file] src/app.ts"), toolRequest)
       assert(!toolRequest.includes("large private output"), toolRequest)
       assert(!toolRequest.includes("PREVIOUS RECAP"), toolRequest)
@@ -247,9 +252,60 @@ try {
       assert(!retryRequest.includes("Recap from project model."), retryRequest)
       assert(!retryRequest.includes("Check the tests"), retryRequest)
       assert(!retryRequest.includes("[tool] bash"), retryRequest)
+      onDeleted({ data: { sessionID: session.id } })
+      toolHistory.push({ id: "m4", type: "user", text: "Follow-up" })
+      await triggerDigest()
+      assert.equal(calls, 5)
+      const clearedRequest = JSON.stringify(requests.at(-1))
+      assert(clearedRequest.includes("Check the tests"), clearedRequest)
+      assert(clearedRequest.includes("Follow-up"), clearedRequest)
+      assert(!clearedRequest.includes("PREVIOUS RECAP"), clearedRequest)
+      assert(!clearedRequest.includes("LAST-CONTEXT"), clearedRequest)
     } finally { stopDigest() }
+    let timeoutCalls = 0
+    let releaseLate
+    let onTimeoutSuccess
+    const timeoutPrompts = []
+    const timeoutToasts = []
+    const disposeTimeout = tuiPlugin.setup({
+      options: { budget: 160, timeout_ms: 150 },
+      client: { rpc: () => ({ summarize: (input) => {
+        timeoutCalls++
+        timeoutPrompts.push(input.prompt)
+        if (timeoutCalls === 1) return new Promise((resolve) => { releaseLate = () => resolve({ text: "late recap", warnings: [] }) })
+        return { text: "Recap after timeout.", warnings: [] }
+      } }) },
+      data: {
+        on: (type, handler) => { if (type === "session.execution.succeeded") onTimeoutSuccess = handler; return () => {} },
+        session: {
+          get: () => ({ id: session.id, location }),
+          message: { sync: async () => {}, list: () => toolHistory },
+        },
+      },
+      ui: { slot: () => () => {}, toast: { show: (toast) => timeoutToasts.push(toast) } },
+    })
+    try {
+      onTimeoutSuccess({ data: { sessionID: session.id } })
+      for (let i = 0; i < 50 && !timeoutToasts.some((toast) => toast.message.includes("timed out")); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+      assert(timeoutToasts.some((toast) => toast.variant === "error" && toast.message.includes("timed out")), JSON.stringify(timeoutToasts))
+      assert.equal(timeoutCalls, 1)
+      releaseLate()
+      await new Promise((resolve) => setImmediate(resolve))
+      onTimeoutSuccess({ data: { sessionID: session.id } })
+      for (let i = 0; i < 50 && timeoutCalls < 2; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+      assert.equal(timeoutCalls, 2)
+      const afterTimeout = timeoutPrompts.at(-1)
+      assert(afterTimeout.includes("Follow-up"), afterTimeout)
+      assert(!afterTimeout.includes("late recap"), afterTimeout)
+      assert(!afterTimeout.includes("PREVIOUS RECAP"), afterTimeout)
+    } finally { disposeTimeout() }
     console.log(JSON.stringify({ installed, model: recaps.at(-1).model, text: "Recap from project model.",
-      sessions: 2, childIgnored: true, historyMessages: history.length, providerRequests: requests.length, sidebarUpdated: true }, null, 2))
+      sessions: 2, childIgnored: true, historyMessages: history.length, providerRequests: requests.length, sidebarUpdated: true,
+      deletionClearedState: true, timeoutEndedLocalWait: true }, null, 2))
   } finally {
     tui.kill()
   }

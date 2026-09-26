@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
-import { LruMap, RECAP_SESSION_STATE_LIMIT, createRecapRecord } from "./recap-state.ts"
+import { LruMap, RECAP_SESSION_STATE_LIMIT } from "./recap-state.ts"
 
 describe("LruMap", () => {
   it("stores and returns values", () => {
@@ -46,16 +46,6 @@ describe("LruMap", () => {
     lru.set("b", 2)
     assert.equal(lru.size, 1)
     assert.equal(lru.has("a"), false)
-  })
-})
-
-describe("createRecapRecord", () => {
-  it("starts with no anchor, no lastRecap and no signals", () => {
-    const record = createRecapRecord()
-    assert.equal(record.anchor, undefined)
-    assert.equal(record.lastRecap, undefined)
-    assert.equal(record.recap, undefined)
-    assert.equal(record.loading, undefined)
   })
 })
 
