@@ -2,12 +2,39 @@ import assert from "node:assert/strict"
 import { spawn, execFileSync } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { createServer } from "node:http"
-import { mkdtemp, mkdir, readdir, symlink, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readdir, readFile, symlink, writeFile } from "node:fs/promises"
+import { readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
+import { batch } from "solid-js"
+import { createStore, reconcile } from "solid-js/store"
 import { OpenCode } from "@opencode/client"
 import { Recap } from "../dist/rpc.js"
+
+// A file-backed stand-in for the host's plugin storage: the same
+// load-mutate-persist-reconcile shape, so in-probe plugin instances can only
+// keep state the real TUI would also keep. The directory must exist.
+const makeStorage = (directory) => ({
+  store: (key, options) => {
+    const file = join(directory, `plugin.supercode.recap.tui.${key}.json`)
+    const initial = structuredClone(options.initial)
+    const load = () => {
+      try { return JSON.parse(readFileSync(file, "utf8")) } catch { return structuredClone(initial) }
+    }
+    const [store, setStore] = createStore(load())
+    const update = (mutation) => {
+      const draft = load()
+      mutation(draft)
+      const next = JSON.parse(JSON.stringify(draft))
+      writeFileSync(file, `${JSON.stringify(next)}\n`)
+      batch(() => setStore(reconcile(next)))
+      return Promise.resolve()
+    }
+    return [store, update]
+  },
+})
+
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)))
 const probeRoot = join(tmpdir(), "opencode")
@@ -49,11 +76,12 @@ const mock = createServer(async (req, res) => {
     digestCount++
     // Digests 1 and 2 are slow enough to observe the indicator and outlive the
     // timeout; digest 5 answers after the live deletion it was started by.
+    // Digest 3 carries markdown so the sidebar's markdown rendering is real.
     if (digestCount === 1) { await sleep(1200); stream("First recap text") }
     else if (digestCount === 2) { await sleep(4000); stream("Late recap text") }
     else if (digestCount === 5) { await sleep(3000); stream("Fifth recap text") }
     else if (prompt.includes("[tool] read")) stream("Tool work recap.")
-    else if (digestCount === 3) stream("Third recap text")
+    else if (digestCount === 3) stream("Third **recap** text")
     else stream(`Recap text ${digestCount}`)
   } else if (prompt.includes("Use read tool") && toolCalls === 0) {
     toolCalls++
@@ -89,10 +117,17 @@ await mkdir(installed, { recursive: true })
 execFileSync("tar", ["-xzf", archive, "-C", installed, "--strip-components=1"], { stdio: "pipe" })
 await symlink(join(root, "node_modules"), join(installed, "node_modules"), "dir")
 const { default: tuiPlugin } = await import(pathToFileURL(join(installed, "tui.js")).href)
+const storages = join(temp, "storages")
+await mkdir(join(storages, "child"), { recursive: true })
+await mkdir(join(storages, "digest"), { recursive: true })
+await mkdir(join(storages, "lifecycle"), { recursive: true })
+await mkdir(join(storages, "reload"), { recursive: true })
+await mkdir(join(storages, "hung"), { recursive: true })
 let onSuccess
 let childCalls = 0
 const disposeChild = tuiPlugin.setup({
   options: {},
+  storage: makeStorage(join(storages, "child")),
   client: { rpc: () => ({ summarize: () => { childCalls++; return { text: "unexpected" } } }) },
   data: {
     on: (type, handler) => { if (type === "session.execution.succeeded") onSuccess = handler; return () => {} },
@@ -115,7 +150,7 @@ const password = "recap-probe-password"
 const env = { ...process.env, XDG_CONFIG_HOME: config, XDG_DATA_HOME: join(temp, "data"),
   XDG_CACHE_HOME: join(temp, "cache"), XDG_STATE_HOME: join(temp, "state"),
   OPENCODE_DB: join(temp, "database.sqlite"), OPENCODE_SERVER_PASSWORD: password,
-  RECAP_PROBE_KEY: "test-only", TERM: "xterm-256color" }
+  RECAP_PROBE_KEY: "test-only", TERM: "xterm-256color", COLORTERM: "truecolor" }
 delete env.OPENCODE_CONFIG_DIR
 delete env.ORCA_OPENCODE_CONFIG_DIR
 const port = 19000 + Math.floor(Math.random() * 10000)
@@ -156,8 +191,13 @@ try {
   )
   assert.equal(requests.length, requestsBeforeUnavailable, "an unavailable RPC must not fall back to a model call")
   const session = await client.session.create({ location })
-  const tui = spawn("python3", [join(root, "scripts", "probe-pty.py"), "opencode", "--server",
-    `http://127.0.0.1:${port}`, "--session", session.id, project], { cwd: project, env, stdio: ["pipe", "pipe", "pipe"] })
+  const startTui = () => {
+    const child = spawn("python3", [join(root, "scripts", "probe-pty.py"), "opencode", "--server",
+      `http://127.0.0.1:${port}`, "--session", session.id, project], { cwd: project, env, stdio: ["pipe", "pipe", "pipe"] })
+    child.stdout.on("data", recordScreen)
+    child.stderr.on("data", recordScreen)
+    return child
+  }
   let screen = ""
   let toolShown = false
   let historyMessages = 0
@@ -166,29 +206,32 @@ try {
     const start = screen.lastIndexOf("Tool wo")
     if (start >= 0) toolShown ||= /Tool wo\x1b\[0m\x1b\[6;129H[^\n]*k recap\./.test(screen.slice(start, start + 200))
   }
-  tui.stdout.on("data", recordScreen)
-  tui.stderr.on("data", recordScreen)
+  let tui = startTui()
+  // What the user actually sees: escape sequences (including the SGR color
+  // changes inside a markdown-rendered recap) stripped away.
+  const visible = (frame) => frame.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")
   const waitFor = async (value) => {
     for (let i = 0; i < 150; i++) {
-      if (screen.includes(value) || (value === "Tool work recap." && toolShown)) return
+      if (visible(screen).includes(value) || (value === "Tool work recap." && toolShown)) return
       if (tui.exitCode !== null) break
       await sleep(200)
     }
-    throw new Error(`TUI did not show ${value}: ${screen.slice(-1500)}`)
+    throw new Error(`TUI did not show ${value}: ${screen.slice(-6000)}`)
   }
   // The renderer emits diffs, so a changed sidebar line only contains its
   // changed cells. Resizing forces a full repaint: bytes captured after this
   // point are the whole current frame, which makes both presence and absence
   // checks meaningful. The value is first located, then captured again from a
   // single fresh repaint so stale frames cannot satisfy absence checks.
-  const waitForRepaint = async (value) => {
+  const waitForRepaint = async (value, cols = 220) => {
+    const shown = () => (typeof value === "function" ? value(screen) : visible(screen).includes(value))
     const deadline = Date.now() + 60_000
     let round = 0
     const capture = async () => {
       screen = ""
-      tui.stdin.write(`resize ${round++ % 2 ? 50 : 49} 220\n`)
+      tui.stdin.write(`resize ${round++ % 2 ? 50 : 49} ${cols}\n`)
       for (let i = 0; i < 25 && Date.now() < deadline; i++) {
-        if (screen.includes(value)) return true
+        if (shown()) return true
         if (tui.exitCode !== null) return false
         await sleep(200)
       }
@@ -201,10 +244,85 @@ try {
       await sleep(400)
       return
     }
-    throw new Error(`TUI never repainted ${value}: ${screen.slice(-1500)}`)
+    const failure = new Error(`TUI never repainted ${typeof value === "function" ? "the state" : value}: ${screen.slice(-6000)}`)
+    // Diagnostic escape hatch: the whole last frame, for offline inspection.
+    const { writeFileSync: dumpFrame } = await import("node:fs")
+    try { dumpFrame("/tmp/opencode/probe-screen.bin", screen) } catch {}
+    throw failure
+  }
+  // Full-repaint frames are positioned text: split one into (row, col, text)
+  // runs so the probe can locate sidebar UI — and its colors — in the stream.
+  const frameRuns = (frame) => {
+    const marked = frame.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, (sequence) => {
+      const cup = /^\x1b\[(\d+);(\d+)H$/.exec(sequence)
+      return cup ? `\x00${cup[1]},${cup[2]}\x00` : ""
+    })
+    const runs = []
+    let row = 1
+    let col = 1
+    let text = ""
+    const flush = () => {
+      const clean = text.replace(/[\r\n]/g, "")
+      if (clean) runs.push({ row, col, text: clean })
+      text = ""
+    }
+    for (const piece of marked.split("\x00")) {
+      const position = /^(\d+),(\d+)$/.exec(piece)
+      if (position) { flush(); row = Number(position[1]); col = Number(position[2]) }
+      else text += piece
+    }
+    flush()
+    return runs
+  }
+  // The Recap header as painted: where the "Recap" label sits and which arrow
+  // it shows, so a mouse click can target it. The box gap paints a space run
+  // between arrow and label, so scan every run in the few columns left of the
+  // label rather than just the immediately preceding one.
+  const recapHeader = (frame) => {
+    const runs = frameRuns(frame)
+    const label = runs.find((run) => run.text.includes("Recap"))
+    if (!label) return undefined
+    const offset = label.text.indexOf("Recap")
+    const left = runs
+      .filter((run) => run.row === label.row
+        && run.col + run.text.length > label.col + offset - 4
+        && run.col < label.col + offset)
+      .sort((a, b) => a.col - b.col)
+    const around = `${left.map((run) => run.text).join("")}${label.text}`
+    return {
+      row: label.row,
+      col: label.col + offset,
+      arrow: around.includes("▼") ? "▼" : around.includes("▶") ? "▶" : undefined,
+    }
+  }
+  // The SGR color active right before a pattern match in the raw frame —
+  // truecolor or 256-color. The recap body interleaves escapes (bold spans),
+  // so callers pass a regex, not a literal.
+  const colorBefore = (frame, pattern) => {
+    const at = pattern.exec(frame)?.index
+    if (at === undefined) return undefined
+    const colors = [...frame.slice(0, at).matchAll(/\x1b\[[0-9;]*(?:38;2;(\d+);(\d+);(\d+)|38;5;(\d+))[0-9;]*m/g)]
+    const last = colors.at(-1)
+    return last ? last.slice(1).filter(Boolean).join(".") : undefined
+  }
+  // The live TUI persists plugin storage under its isolated state root.
+  const findTuiStorage = async (directory) => {
+    for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
+      const path = join(directory, entry.name)
+      if (entry.isFile() && entry.name === "plugin.supercode.recap.tui.sidebar.json") return path
+      if (entry.isDirectory()) {
+        const nested = await findTuiStorage(path)
+        if (nested) return nested
+      }
+    }
+    return undefined
   }
   try {
     await waitFor("Recap")
+    // The slot is registered after the first paint; force one so the waiting
+    // state (and everything else the section renders) is actually on screen.
+    // The hint wraps in the ~40-column sidebar, so match its first line.
+    await waitForRepaint("Recap appears after the session's")
     await client.session.prompt({ sessionID: session.id, text: "Fix the sidebar", location })
     await waitFor("Generating recap")
     await waitForRepaint("First recap text")
@@ -221,6 +339,24 @@ try {
     await client.session.prompt({ sessionID: session.id, text: "Third prompt", location })
     for (let i = 0; i < 25 && digestRequests().length < 3; i++) await sleep(200)
     await waitForRepaint("Third recap text")
+    // Digest 3 carries markdown: the sidebar must render it (concealed
+    // markers) rather than echoing the raw text.
+    assert(!visible(screen).includes("**"), "markdown markers must be concealed in the sidebar")
+    // "recap" is a bold span, so the color probe tolerates interleaved escapes.
+    const recapColor = (frame) => colorBefore(frame, /Third (?:\x1b\[[0-9;?]*[A-Za-z])*recap/)
+    const darkColor = recapColor(screen)
+    assert(darkColor, "the recap must paint with a theme color")
+    // Narrow and wide terminals must both keep the section readable. Below
+    // ~120 columns the host turns the sidebar into a hidden overlay, so the
+    // narrow check uses 130 — the narrowest width that still shows it inline.
+    await waitForRepaint("Third recap text", 130)
+    await waitForRepaint("Third recap text")
+    // A live terminal theme switch must recolor the section, not break it.
+    tui.stdin.write("theme light\n")
+    await waitForRepaint("Third recap text")
+    const lightColor = recapColor(screen)
+    assert(lightColor, "the recap must still paint after the theme switch")
+    assert.notEqual(lightColor, darkColor, `a theme switch must recolor the recap: ${darkColor} -> ${lightColor}`)
     const transferred = await client.session.export({ sessionID: session.id, location })
     // Import inserts message IDs verbatim, so reusing the parent's settled
     // history collides with its rows; the child only needs to exist and run.
@@ -271,6 +407,37 @@ try {
     assert(third.includes("Third prompt"), third)
     const toolRecap = JSON.stringify(recaps[3])
     assert(toolRecap.includes("[tool] read"), toolRecap)
+    // --- sidebar: collapse, persisted choice, restart, waiting state ---
+    await waitForRepaint("Tool work recap.")
+    const header = recapHeader(screen)
+    if (!header || header.arrow !== "▼") {
+      const { writeFileSync: dumpFrame } = await import("node:fs")
+      dumpFrame("/tmp/opencode/probe-header.bin", screen)
+    }
+    assert(header, `the sidebar must paint the Recap header: ${screen.slice(-1200)}`)
+    assert.equal(header.arrow, "▼", `an untouched section starts expanded: ${JSON.stringify(header)}`)
+    tui.stdin.write(`mouse ${header.col} ${header.row}\n`)
+    await waitForRepaint((frame) => recapHeader(frame)?.arrow === "▶")
+    assert(!visible(screen).includes("Tool work recap."), "collapsing must hide the recap body")
+    // The choice is durable host storage; the recap text itself is not.
+    const storageFile = await findTuiStorage(join(temp, "state"))
+    assert(storageFile, "the collapse choice must be persisted by the TUI host")
+    assert.deepEqual(JSON.parse(await readFile(storageFile, "utf8")), { expanded: false })
+    // Restart the TUI against the same session: the choice survives, the
+    // recap text does not.
+    tui.kill()
+    await new Promise((resolve) => { tui.once("exit", resolve); tui.once("error", resolve) })
+    screen = ""
+    tui = startTui()
+    await waitFor("Recap")
+    await waitForRepaint((frame) => recapHeader(frame)?.arrow === "▶")
+    assert(!visible(screen).includes("Tool work recap."), "a restarted TUI must not resurrect the recap text")
+    assert(!visible(screen).includes("Recap appears after"), "a collapsed section hides the waiting hint")
+    const restarted = recapHeader(screen)
+    assert(restarted, "the restarted TUI must paint the Recap header")
+    tui.stdin.write(`mouse ${restarted.col} ${restarted.row}\n`)
+    await waitForRepaint((frame) => recapHeader(frame)?.arrow === "▼")
+    await waitFor("Recap appears after the session's")
     // In-flight deletion through the live host: the release must not wait for
     // the timeout, the late answer must be discarded and no failure reported.
     const deletionDigest = digestRequests().length + 1
@@ -301,6 +468,7 @@ try {
   let onDeleted
   const stopDigest = tuiPlugin.setup({
     options: { budget: 160 },
+    storage: makeStorage(join(storages, "digest")),
     client: { rpc: () => ({
       // Older servers may not answer settings; the local budget must then apply.
       settings: async () => { throw new Error("settings unavailable") },
@@ -381,7 +549,7 @@ try {
   const settle = async () => {
     for (let i = 0; i < 3; i++) await new Promise((resolve) => setImmediate(resolve))
   }
-  const makeLifecycleHarness = (settingsImpl) => {
+  const makeLifecycleHarness = (settingsImpl, storageKey = "lifecycle") => {
     const state = {
       toasts: [], calls: [], stops: { success: 0, deleted: 0, slot: 0 },
       settingsCalls: 0, settingsLocations: [], settingsOptions: undefined,
@@ -392,6 +560,7 @@ try {
       // Local values are deliberately hostile: the server's settings, bound to
       // the generation timeout, must win over them.
       options: { budget: 1, timeout_ms: 500 },
+      storage: makeStorage(join(storages, storageKey)),
       client: { rpc: () => ({
         settings: settingsImpl ?? (async (_input, rpcOptions) => {
           state.settingsCalls += 1
@@ -430,7 +599,7 @@ try {
     })
     return { state, dispose }
   }
-  const lifecycle = makeLifecycleHarness()
+  const lifecycle = makeLifecycleHarness(undefined, "lifecycle")
   const a = { id: "root-a", location }
   const b = { id: "root-b", location: { directory: join(project, "elsewhere") } }
   lifecycle.state.sessions.set(a.id, a)
@@ -529,7 +698,7 @@ try {
   lifecycle.state.onSuccess({ data: { sessionID: a.id } })
   await settle()
   const aUnloaded = lifecycle.state.calls.at(-1)
-  const reloaded = makeLifecycleHarness()
+  const reloaded = makeLifecycleHarness(undefined, "reload")
   reloaded.state.sessions.set(a.id, a)
   reloaded.state.histories.set(a.id, [{ id: "r1", type: "user", text: "fresh after reload" }])
   lifecycle.dispose()
@@ -558,7 +727,7 @@ try {
     return new Promise((_, reject) => {
       rpcOptions.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true })
     })
-  })
+  }, "hung")
   hung.state.sessions.set(a.id, a)
   hung.state.histories.set(a.id, [{ id: "h1", type: "user", text: "hung settings" }])
   hung.state.onSuccess({ data: { sessionID: a.id } })
@@ -574,6 +743,8 @@ try {
   hung.dispose()
   console.log(JSON.stringify({ installed, model: digestRequests().at(-1).model, sidebarText: "Tool work recap.",
     sessions: 2, childIgnored: true, historyMessages, providerRequests: requests.length, sidebarUpdated: true,
+    waitingStateShown: true, markdownConcealed: true, narrowTerminalReadable: true, themeSwitchRecolored: true,
+    collapseClickWorked: true, choicePersistedAcrossRestart: true, recapTextNotPersisted: true,
     indicatorClearedOnSuccess: true, indicatorClearedOnTimeout: true, timedOutWindowRetried: true, lateAnswerDiscarded: true,
     liveDeletionReleasedWait: true, unavailableRpcRejected: true, deletionClearedState: true, timeoutEndedLocalWait: true,
     reentrySingleGeneration: true, sessionIsolation: true, settingsLocationRouted: true, settingsCachePerLocation: true,

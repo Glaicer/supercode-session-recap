@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
-import { createSignal, Show } from "solid-js"
+import { createMemo, createSignal, onCleanup, Show } from "solid-js"
+import { SyntaxStyle, type RGBA } from "@opentui/core"
 import { Plugin } from "@opencode/plugin/tui"
 import { Recap, type RecapSettingsOutput, type RecapSummarizeOutput } from "./rpc.ts"
 import { buildRecapDigest, buildRecapRequest } from "./recap-digest.ts"
@@ -10,6 +11,39 @@ const errorText = (error: unknown): string => {
   const message = (error as { message?: unknown } | null | undefined)?.message
   return typeof message === "string" && message ? message : String(error)
 }
+
+// The sidebar reads these theme tokens. The host keeps its markdown
+// SyntaxStyle private, so the plugin derives its own from the visible tokens —
+// enough for the inline markup a Recap can carry.
+type RecapTheme = {
+  readonly text: { readonly base: RGBA; readonly muted: RGBA }
+  readonly markdown: {
+    readonly text: RGBA
+    readonly heading: RGBA
+    readonly strong: RGBA
+    readonly emphasis: RGBA
+    readonly code: RGBA
+    readonly listItem: RGBA
+    readonly blockQuote: RGBA
+    readonly link: RGBA
+    readonly linkText: RGBA
+  }
+}
+
+const syntaxStyleFor = (theme: RecapTheme) => SyntaxStyle.fromStyles({
+  "default": { fg: theme.markdown.text },
+  "conceal": { fg: theme.text.muted },
+  "markup.heading": { fg: theme.markdown.heading, bold: true },
+  "markup.strong": { fg: theme.markdown.strong, bold: true },
+  "markup.italic": { fg: theme.markdown.emphasis, italic: true },
+  "markup.list": { fg: theme.markdown.listItem },
+  "markup.quote": { fg: theme.markdown.blockQuote, italic: true },
+  "markup.raw": { fg: theme.markdown.code },
+  "markup.link": { fg: theme.markdown.link, underline: true },
+  "markup.link.url": { fg: theme.markdown.link, underline: true },
+  "markup.link.label": { fg: theme.markdown.linkText },
+  "markup.strikethrough": { fg: theme.text.muted },
+})
 
 export default Plugin.define({
   id: "supercode.recap.tui",
@@ -41,6 +75,9 @@ export default Plugin.define({
     }
     const recaps = new LruMap<string, RecapSessionState>(RECAP_SESSION_STATE_LIMIT)
     const warned = new LruMap<string, Set<RecapWarningSource>>(RECAP_SESSION_STATE_LIMIT)
+    // Only the collapsed/expanded choice is durable; the Recap text itself
+    // stays in the bounded in-memory state above.
+    const [sidebar, setSidebar] = context.storage.store("sidebar", { initial: { expanded: true } })
     const [revision, setRevision] = createSignal(0)
     const [generatingRevision, setGeneratingRevision] = createSignal(0)
     const inflight = new Map<string, AbortController>()
@@ -162,16 +199,44 @@ export default Plugin.define({
     const removeSlot = context.ui.slot({
       append: "sidebar.content",
       render: ({ sessionID }) => {
-        const [expanded, setExpanded] = createSignal(true)
+        let current: SyntaxStyle | undefined
+        // A theme switch swaps the style; the old one is released once the
+        // renderer has painted the replacement, mirroring the host's own
+        // SyntaxStyle release.
+        const release = (style: SyntaxStyle) => {
+          void context.renderer.idle().catch(() => {}).finally(() => style.destroy())
+        }
+        const syntax = createMemo(() => {
+          const theme: RecapTheme = context.theme
+          const previous = current
+          current = syntaxStyleFor(theme)
+          if (previous) release(previous)
+          return current
+        })
+        onCleanup(() => { if (current) release(current) })
+        const toggle = () => void setSidebar((draft) => { draft.expanded = !draft.expanded })
         return (
           <box>
-            <box flexDirection="row" gap={1} onMouseDown={() => setExpanded(!expanded())}>
-              <text fg={context.theme.text.base}>{expanded() ? "▼" : "▶"}</text>
+            <box flexDirection="row" gap={1} onMouseDown={toggle}>
+              <text fg={context.theme.text.base}>{sidebar.expanded ? "▼" : "▶"}</text>
               <text fg={context.theme.text.base}><b>Recap</b></text>
             </box>
-            <Show when={expanded()}>
-              <Show when={recapOf(sessionID)}>
-                <text fg={context.theme.text.muted}>{recapOf(sessionID)?.text}</text>
+            <Show when={sidebar.expanded}>
+              <Show
+                when={recapOf(sessionID)}
+                fallback={
+                  <Show when={!isGenerating(sessionID)}>
+                    <text fg={context.theme.text.muted}>Recap appears after the session's next run.</text>
+                  </Show>
+                }
+              >
+                <markdown
+                  syntaxStyle={syntax()}
+                  content={recapOf(sessionID)?.text ?? ""}
+                  conceal={true}
+                  internalBlockMode="top-level"
+                  fg={context.theme.markdown.text}
+                />
               </Show>
               <Show when={isGenerating(sessionID)}>
                 <text fg={context.theme.text.muted}>Generating recap…</text>

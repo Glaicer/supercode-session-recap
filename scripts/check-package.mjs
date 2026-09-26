@@ -15,7 +15,9 @@ assert.equal(manifest.exports?.["./rpc"], "./dist/rpc.js", "package must export 
 const entry = readFileSync(resolve(root, target), "utf8");
 assert.doesNotMatch(entry, /<(?:box|text|markdown)\b/, "compiled entry must not contain raw JSX");
 assert.doesNotMatch(entry, /from ["'][^"']+\.tsx?["']/, "compiled entry must not import TypeScript");
-assert.match(entry, /get when\(\)/, "Solid transform must preserve reactive Show getters");
+assert.match(entry, /get when\(\)/, "Solid transform must preserve reactive Show getters")
+assert.match(entry, /createElement\("markdown"\)/, "compiled entry must render the recap as markdown")
+assert.match(entry, /from ["']@opentui\/core["'];/, "compiled entry must reuse the host's OpenTUI core");
 
 const packed = JSON.parse(
   execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
