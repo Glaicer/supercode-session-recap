@@ -16,22 +16,40 @@ const temp = await mkdtemp(join(probeRoot, "recap-v2-probe-"))
 const project = join(temp, "project")
 const config = join(temp, "config")
 const requests = []
+let toolCalls = 0
 const mock = createServer(async (req, res) => {
   let body = ""
   for await (const chunk of req) body += chunk
   const input = JSON.parse(body)
   requests.push(input)
-  const text = JSON.stringify(input).includes("SESSION DIGEST:") ? "Recap from project model." : "The sidebar is fixed."
+  const prompt = JSON.stringify(input)
+  const toolDigest = prompt.includes("[tool] read")
+  const text = prompt.includes("SESSION DIGEST:")
+    ? toolDigest ? "Tool work recap." : "Recap from project model."
+    : "The sidebar is fixed."
   res.setHeader("content-type", "text/event-stream")
   const event = (delta, finish_reason = null) => ({ id: "mock", object: "chat.completion.chunk", created: 1,
     model: input.model, choices: [{ index: 0, delta, finish_reason }] })
-  res.write(`data: ${JSON.stringify(event({ role: "assistant", content: text }))}\n\n`)
-  res.write(`data: ${JSON.stringify(event({}, "stop"))}\n\n`)
+  if (prompt.includes("Use read tool") && !prompt.includes("SESSION DIGEST:") && toolCalls === 0) {
+    toolCalls++
+    const names = Array.isArray(input.tools)
+      ? input.tools.map((tool) => tool.function?.name ?? tool.name)
+      : Object.keys(input.tools ?? {})
+    const name = names.find((key) => key === "read" || key.endsWith("_read"))
+    assert(name, `Read tool missing from model request: ${names}`)
+    res.write(`data: ${JSON.stringify(event({ tool_calls: [{ index: 0, id: "call_recap_probe", type: "function",
+      function: { name, arguments: JSON.stringify({ path: "README.md" }) } }] }))}\n\n`)
+    res.write(`data: ${JSON.stringify(event({}, "tool_calls"))}\n\n`)
+  } else {
+    res.write(`data: ${JSON.stringify(event({ role: "assistant", content: text }))}\n\n`)
+    res.write(`data: ${JSON.stringify(event({}, "stop"))}\n\n`)
+  }
   res.end("data: [DONE]\n\n")
 })
 await new Promise((ok) => mock.listen(0, "127.0.0.1", ok))
 const modelPort = mock.address().port
 await mkdir(project, { recursive: true })
+await writeFile(join(project, "README.md"), "Probe project fixture.\n")
 await mkdir(join(config, "opencode"), { recursive: true })
 const install = join(temp, "install")
 await mkdir(install, { recursive: true })
@@ -101,15 +119,21 @@ try {
   const tui = spawn("python3", [join(root, "scripts", "probe-pty.py"), "opencode", "--server",
     `http://127.0.0.1:${port}`, "--session", session.id, project], { cwd: project, env, stdio: ["ignore", "pipe", "pipe"] })
   let screen = ""
-  tui.stdout.on("data", (bytes) => screen = (screen + bytes).slice(-500_000))
-  tui.stderr.on("data", (bytes) => screen = (screen + bytes).slice(-500_000))
+  let toolShown = false
+  const recordScreen = (bytes) => {
+    screen = (screen + bytes).slice(-500_000)
+    const start = screen.lastIndexOf("Tool wo")
+    if (start >= 0) toolShown ||= /Tool wo\x1b\[0m\x1b\[6;129H[^\n]*k recap\./.test(screen.slice(start, start + 200))
+  }
+  tui.stdout.on("data", recordScreen)
+  tui.stderr.on("data", recordScreen)
   const waitFor = async (value) => {
     for (let i = 0; i < 100; i++) {
-      if (screen.includes(value)) return
+      if (screen.includes(value) || (value === "Tool work recap." && toolShown)) return
       if (tui.exitCode !== null) break
       await new Promise((ok) => setTimeout(ok, 200))
     }
-    throw new Error(`TUI did not show ${value}: ${screen.slice(-5000)}`)
+    throw new Error(`TUI did not show ${value}: ${screen.slice(-1500)}`)
   }
   try {
     await waitFor("Recap")
@@ -135,6 +159,22 @@ try {
     assert.equal(recaps.at(-1).model, "project-only")
     assert(JSON.stringify(recaps.at(-1)).includes("user: Fix the sidebar"))
     assert(JSON.stringify(recaps.at(-1)).includes("assistant: The sidebar is fixed."))
+    await client.session.prompt({ sessionID: session.id, text: "Use read tool to inspect README.md", location })
+    await client.session.wait({ sessionID: session.id, location })
+    const toolHistoryLive = await client.session.context({ sessionID: session.id, location })
+    assert(toolHistoryLive.some((message) => message.type === "assistant" && message.content.some(
+      (part) => part.type === "tool" && part.name === "read" && part.state.status === "completed",
+    )), JSON.stringify(toolHistoryLive.slice(-3)).slice(-3000))
+    for (let i = 0; i < 50 && requests.filter((request) => JSON.stringify(request).includes("SESSION DIGEST:")).length < 3; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+    const liveToolRecap = requests.filter((request) => JSON.stringify(request).includes("SESSION DIGEST:")).at(-1)
+    assert(JSON.stringify(liveToolRecap).includes("[tool] read"), JSON.stringify({
+      count: requests.filter((request) => JSON.stringify(request).includes("SESSION DIGEST:")).length,
+      last: JSON.stringify(liveToolRecap).slice(-1800),
+    }))
+    await waitFor("Tool work recap.")
+    assert.equal(toolCalls, 1)
     const toolHistory = [
       { id: "m1", type: "user", text: "Check the tests" },
       { id: "m2", type: "assistant", content: [{ type: "tool", name: "bash", state: {
@@ -145,6 +185,7 @@ try {
     let empty = false
     let fail = false
     let calls = 0
+    const toasts = []
     let onDigestSuccess
     const stopDigest = tuiPlugin.setup({
       options: { budget: 12000 },
@@ -162,9 +203,9 @@ try {
           message: { sync: async () => {}, list: () => toolHistory },
         },
       },
-      ui: { slot: () => () => {}, toast: { show: () => {} } },
+      ui: { slot: () => () => {}, toast: { show: (toast) => toasts.push(toast) } },
     })
-    const succeed = async (expectsCall = true) => {
+    const triggerDigest = async (expectsCall = true) => {
       const done = expectsCall
         ? Promise.race([
           new Promise((resolve) => { completed = resolve }),
@@ -176,24 +217,25 @@ try {
       await new Promise((resolve) => setImmediate(resolve))
     }
     try {
-      await succeed()
+      await triggerDigest()
       const toolRequest = JSON.stringify(requests.at(-1))
       assert(toolRequest.includes("[tool] bash npm test -> ok"), toolRequest)
       assert(toolRequest.includes("[file] src/app.ts"), toolRequest)
       assert(!toolRequest.includes("large private output"), toolRequest)
       assert(!toolRequest.includes("PREVIOUS RECAP"), toolRequest)
-      await succeed(false)
+      await triggerDigest(false)
       assert.equal(calls, 1, "empty incremental window must not call the model")
       toolHistory.push({ id: "m3", type: "user", text: "New task" })
       empty = true
-      await succeed()
+      await triggerDigest()
       assert.equal(calls, 2)
+      assert(toasts.some((toast) => toast.variant === "error" && toast.message.includes("empty response")))
       empty = false
       fail = true
-      await succeed()
+      await triggerDigest()
       assert.equal(calls, 3)
       fail = false
-      await succeed()
+      await triggerDigest()
       assert.equal(calls, 4)
       const retryRequest = JSON.stringify(requests.at(-1))
       assert(retryRequest.includes("New task"), retryRequest)

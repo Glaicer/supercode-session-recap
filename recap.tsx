@@ -42,7 +42,12 @@ export default Plugin.define({
             warned.add(key)
             context.ui.toast.show({ title: "Recap", variant: "warning", message: warning.message })
           }
-          if (!disposed && response.text.trim()) setState((current) => ({
+          if (disposed) return
+          if (!response.text.trim()) {
+            context.ui.toast.show({ title: "Recap", variant: "error", message: "Recap failed: empty response" })
+            return
+          }
+          setState((current) => ({
             ...current, [sessionID]: { text: response.text.trim(), anchor: lastIncludedID },
           }))
         } catch (error) {

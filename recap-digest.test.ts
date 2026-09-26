@@ -144,6 +144,14 @@ describe("buildRecapDigest — text and reasoning", () => {
     assert.ok(built.digest.includes("truncated"), built.digest)
     assert.ok(!built.digest.includes("a".repeat(500)), "full text survived")
   })
+  it("retains the latest text and discloses part-level truncation in the request", () => {
+    const built = buildRecapDigest([{ id: "a1", type: "assistant", content: [
+      textPart(`${"older ".repeat(100)}LATEST-RESULT`),
+    ] }], { budget: 1000 })
+    assert.ok(built.digest.includes("LATEST-RESULT"), built.digest)
+    assert.ok(built.truncated)
+    assert.match(buildRecapRequest(built), /truncated from its beginning/)
+  })
   it("non-user/assistant roles and empty folds are skipped", () => {
     const built = buildRecapDigest([
       msg("m0", "system", [textPart("sys")]),

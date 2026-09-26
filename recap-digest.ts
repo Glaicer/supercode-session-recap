@@ -111,7 +111,7 @@ function foldTextPart(part: Record<string, unknown>): string {
   const body = raw.trim()
   if (!body) return ""
   if (body.length <= TEXT_PART_LIMIT) return body
-  return `${body.slice(0, TEXT_PART_LIMIT)}\n[…text truncated — ${body.length - TEXT_PART_LIMIT} more characters cut]`
+  return `[…text truncated — ${body.length - TEXT_PART_LIMIT} earlier characters cut]\n${body.slice(-TEXT_PART_LIMIT)}`
 }
 
 function foldMessage(entry: DigestMessage): string {
@@ -191,6 +191,7 @@ export function buildRecapDigest(
     kept.push(last.slice(Math.max(0, last.length - budget)))
     truncated = true
   }
+  if (kept.some((text) => text.includes("[…text truncated"))) truncated = true
 
   // Anchor covers the end of the window even when its own fold was empty or
   // partially cut: the next Recap takes messages strictly after it.
