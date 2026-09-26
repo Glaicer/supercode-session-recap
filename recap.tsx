@@ -10,7 +10,7 @@ export default Plugin.define({
   setup(context) {
     const options = parseRecapOptions(context.options)
     const recap = context.client.rpc(Recap)
-    const [state, setState] = createSignal<Record<string, string>>({})
+    const [state, setState] = createSignal<Record<string, { text: string; anchor?: string }>>({})
     const running = new Set<string>()
     const warned = new Set<string>()
     let disposed = false
@@ -23,10 +23,16 @@ export default Plugin.define({
       void (async () => {
         try {
           await context.data.session.message.sync(sessionID)
-          const { digest } = buildRecapDigest(context.data.session.message.list(sessionID), { budget: options.budget })
+          const previous = state()[sessionID]
+          const { digest, truncated, lastIncludedID } = buildRecapDigest(context.data.session.message.list(sessionID), {
+            budget: options.budget,
+            afterMessageID: previous?.anchor,
+          })
           if (!digest || disposed) return
           const location = session.location
-          const response = await recap.summarize({ prompt: buildRecapRequest({ digest }) }, { location }) as {
+          const response = await recap.summarize({ prompt: buildRecapRequest({
+            digest, truncated, previousRecap: previous?.text,
+          }) }, { location }) as {
             text: string
             warnings: Array<{ source: string; message: string }>
           }
@@ -36,7 +42,9 @@ export default Plugin.define({
             warned.add(key)
             context.ui.toast.show({ title: "Recap", variant: "warning", message: warning.message })
           }
-          if (!disposed && response.text.trim()) setState((current) => ({ ...current, [sessionID]: response.text.trim() }))
+          if (!disposed && response.text.trim()) setState((current) => ({
+            ...current, [sessionID]: { text: response.text.trim(), anchor: lastIncludedID },
+          }))
         } catch (error) {
           if (!disposed) context.ui.toast.show({ title: "Recap", variant: "error", message: `Recap failed: ${String(error)}` })
         } finally {
@@ -56,7 +64,7 @@ export default Plugin.define({
               <text fg={context.theme.text.base}><b>Recap</b></text>
             </box>
             <Show when={expanded() && state()[sessionID]}>
-              <text fg={context.theme.text.muted}>{state()[sessionID]}</text>
+              <text fg={context.theme.text.muted}>{state()[sessionID].text}</text>
             </Show>
           </box>
         )

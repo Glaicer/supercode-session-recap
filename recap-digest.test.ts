@@ -33,6 +33,21 @@ const toolError = (tool: string, input: Record<string, unknown>, error: string) 
 })
 
 describe("buildRecapDigest — tool calls", () => {
+  it("folds V2 tool-only work using name and structured error without leaking content", () => {
+    const built = buildRecapDigest([
+      { id: "a1", type: "assistant", content: [
+        { type: "reasoning", text: "SECRET-REASONING" },
+        { type: "tool", id: "call-1", name: "bash", state: {
+          status: "completed", input: { command: "npm test" }, content: [{ type: "text", text: "SECRET-OUTPUT" }],
+        } },
+        { type: "tool", id: "call-2", name: "read", state: {
+          status: "error", input: { filePath: "missing.ts" }, error: { type: "not_found", message: "File not found" },
+        } },
+      ] },
+    ])
+    assert.equal(built.digest, "assistant: [tool] bash npm test -> ok\n[tool] read missing.ts -> error: File not found")
+    assert.ok(!built.digest.includes("SECRET"))
+  })
   it("folds one line per completed call: name, short argument, ok", () => {
     const built = buildRecapDigest([
       msg("m1", "user", [textPart("run the tests")]),
@@ -69,6 +84,14 @@ describe("buildRecapDigest — tool calls", () => {
 })
 
 describe("buildRecapDigest — file edits", () => {
+  it("includes V2 assistant snapshot file paths without diff bytes", () => {
+    const built = buildRecapDigest([{ id: "a1", type: "assistant", snapshot: {
+      files: ["src/app.ts", "src/panel.ts"],
+    }, content: [{ type: "reasoning", text: "SECRET" }] }])
+    assert.ok(built.digest.includes("src/app.ts"), built.digest)
+    assert.ok(built.digest.includes("src/panel.ts"), built.digest)
+    assert.ok(!built.digest.includes("SECRET"))
+  })
   it("edit with diff metadata gives path and +/- counts, no diff content", () => {
     const diff = [
       "--- a/src/a.ts",
@@ -165,6 +188,15 @@ describe("buildRecapDigest — budget window", () => {
     assert.ok(built.digest.length > 0)
     assert.ok(built.truncated)
     assert.equal(built.lastIncludedID, "giant")
+  })
+  it("keeps the newest activity from a single oversized V2 message", () => {
+    const built = buildRecapDigest([{ id: "a1", type: "assistant", content: [
+      { type: "text", text: "old activity ".repeat(80) },
+      { type: "tool", name: "edit", state: { status: "completed", input: { filePath: "latest.ts" } } },
+    ] }], { budget: 75 })
+    assert.ok(built.digest.length <= 75)
+    assert.ok(built.digest.includes("latest.ts"), built.digest)
+    assert.equal(built.truncated, true)
   })
   it("defaults to the 12000-char budget when options omit it", () => {
     const messages = Array.from({ length: 40 }, (_, i) =>

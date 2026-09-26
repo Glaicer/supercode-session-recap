@@ -28,6 +28,7 @@ export type DigestMessage = {
   type?: string
   text?: string
   content?: ReadonlyArray<unknown>
+  snapshot?: { files?: ReadonlyArray<string> }
   info?: unknown
   parts?: ReadonlyArray<unknown>
 }
@@ -86,7 +87,8 @@ function foldToolPart(part: Record<string, unknown>): string {
     error?: unknown
     metadata?: unknown
   }
-  const name = typeof part.tool === "string" && part.tool ? part.tool : "tool"
+  const name = typeof part.name === "string" && part.name ? part.name
+    : typeof part.tool === "string" && part.tool ? part.tool : "tool"
   const input = state.input && typeof state.input === "object" ? state.input : {}
   const arg = shortToolArg(input)
   const sign = FILE_EDIT_TOOLS.has(name) ? " " + changeSign(name, state.metadata as Record<string, unknown> | undefined) : ""
@@ -94,7 +96,9 @@ function foldToolPart(part: Record<string, unknown>): string {
   if (state.status === "completed") {
     outcome = "ok"
   } else if (state.status === "error") {
-    const firstLine = String(state.error ?? "").split("\n")[0] ?? ""
+    const error = state.error && typeof state.error === "object" && "message" in state.error
+      ? state.error.message : state.error
+    const firstLine = (typeof error === "string" ? error : "").split("\n")[0] ?? ""
     outcome = `error: ${shorten(firstLine, TOOL_ERROR_LIMIT)}`
   } else {
     outcome = String(state.status ?? "unknown")
@@ -129,6 +133,14 @@ function foldMessage(entry: DigestMessage): string {
       if (folded) lines.push(folded)
     } else if (p.type === "tool") {
       lines.push(foldToolPart(p))
+    }
+  }
+  if (role === "assistant") {
+    const snapshot = info.snapshot as { files?: unknown } | undefined
+    if (Array.isArray(snapshot?.files)) {
+      for (const file of snapshot.files) {
+        if (typeof file === "string" && file.trim()) lines.push(`[file] ${shorten(file, TOOL_ARG_LIMIT)}`)
+      }
     }
   }
   if (!lines.length) return ""

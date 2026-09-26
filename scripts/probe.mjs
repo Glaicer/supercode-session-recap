@@ -135,6 +135,73 @@ try {
     assert.equal(recaps.at(-1).model, "project-only")
     assert(JSON.stringify(recaps.at(-1)).includes("user: Fix the sidebar"))
     assert(JSON.stringify(recaps.at(-1)).includes("assistant: The sidebar is fixed."))
+    const toolHistory = [
+      { id: "m1", type: "user", text: "Check the tests" },
+      { id: "m2", type: "assistant", content: [{ type: "tool", name: "bash", state: {
+        status: "completed", input: { command: "npm test" }, content: [{ type: "text", text: "large private output" }],
+      } }], snapshot: { files: ["src/app.ts"] } },
+    ]
+    let completed
+    let empty = false
+    let fail = false
+    let calls = 0
+    let onDigestSuccess
+    const stopDigest = tuiPlugin.setup({
+      options: { budget: 12000 },
+      client: { rpc: () => ({ summarize: async (input, options) => {
+        calls++
+        try {
+          if (fail) throw new Error("temporary generation failure")
+          return empty ? { text: "", warnings: [] } : await client.rpc(Recap).summarize(input, options)
+        } finally { completed() }
+      } }) },
+      data: {
+        on: (_type, handler) => { onDigestSuccess = handler; return () => {} },
+        session: {
+          get: () => ({ id: session.id, location }),
+          message: { sync: async () => {}, list: () => toolHistory },
+        },
+      },
+      ui: { slot: () => () => {}, toast: { show: () => {} } },
+    })
+    const succeed = async (expectsCall = true) => {
+      const done = expectsCall
+        ? Promise.race([
+          new Promise((resolve) => { completed = resolve }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Recap RPC was not called")), 5000)),
+        ])
+        : new Promise((resolve) => setTimeout(resolve, 50))
+      onDigestSuccess({ data: { sessionID: session.id } })
+      await done
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    try {
+      await succeed()
+      const toolRequest = JSON.stringify(requests.at(-1))
+      assert(toolRequest.includes("[tool] bash npm test -> ok"), toolRequest)
+      assert(toolRequest.includes("[file] src/app.ts"), toolRequest)
+      assert(!toolRequest.includes("large private output"), toolRequest)
+      assert(!toolRequest.includes("PREVIOUS RECAP"), toolRequest)
+      await succeed(false)
+      assert.equal(calls, 1, "empty incremental window must not call the model")
+      toolHistory.push({ id: "m3", type: "user", text: "New task" })
+      empty = true
+      await succeed()
+      assert.equal(calls, 2)
+      empty = false
+      fail = true
+      await succeed()
+      assert.equal(calls, 3)
+      fail = false
+      await succeed()
+      assert.equal(calls, 4)
+      const retryRequest = JSON.stringify(requests.at(-1))
+      assert(retryRequest.includes("New task"), retryRequest)
+      assert(retryRequest.includes("PREVIOUS RECAP"), retryRequest)
+      assert(retryRequest.includes("Recap from project model."), retryRequest)
+      assert(!retryRequest.includes("Check the tests"), retryRequest)
+      assert(!retryRequest.includes("[tool] bash"), retryRequest)
+    } finally { stopDigest() }
     console.log(JSON.stringify({ installed, model: recaps.at(-1).model, text: "Recap from project model.",
       sessions: 2, childIgnored: true, historyMessages: history.length, providerRequests: requests.length, sidebarUpdated: true }, null, 2))
   } finally {
