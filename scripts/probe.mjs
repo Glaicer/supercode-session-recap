@@ -188,12 +188,14 @@ try {
     const toasts = []
     let onDigestSuccess
     const stopDigest = tuiPlugin.setup({
-      options: { budget: 12000 },
+      options: { budget: 160 },
       client: { rpc: () => ({ summarize: async (input, options) => {
         calls++
         try {
           if (fail) throw new Error("temporary generation failure")
-          return empty ? { text: "", warnings: [] } : await client.rpc(Recap).summarize(input, options)
+          if (empty) return { text: "", warnings: [] }
+          const response = await client.rpc(Recap).summarize(input, options)
+          return calls === 1 ? { ...response, text: `${response.text} ${"x".repeat(300)} LAST-CONTEXT` } : response
         } finally { completed() }
       } }) },
       data: {
@@ -240,7 +242,9 @@ try {
       const retryRequest = JSON.stringify(requests.at(-1))
       assert(retryRequest.includes("New task"), retryRequest)
       assert(retryRequest.includes("PREVIOUS RECAP"), retryRequest)
-      assert(retryRequest.includes("Recap from project model."), retryRequest)
+      assert(retryRequest.includes("LAST-CONTEXT"), retryRequest)
+      assert(retryRequest.includes("…"), retryRequest)
+      assert(!retryRequest.includes("Recap from project model."), retryRequest)
       assert(!retryRequest.includes("Check the tests"), retryRequest)
       assert(!retryRequest.includes("[tool] bash"), retryRequest)
     } finally { stopDigest() }

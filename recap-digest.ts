@@ -211,14 +211,18 @@ export function buildRecapRequest(args: {
   digest: string
   previousRecap?: string | null
   truncated?: boolean
+  budget?: number
 }): string {
   const blocks = [
     "Summarize the coding session below in at most two short sentences: " +
       "what is happening right now and what comes next. " +
       "Plain sentences only — no headings, no bullets, no lists, no intro, no outro.",
   ]
-  if (args.previousRecap) {
-    blocks.push("PREVIOUS RECAP — context from earlier session history:\n" + args.previousRecap)
+  const available = Math.max(0, (args.budget ?? DIGEST_DEFAULT_BUDGET) - args.digest.length)
+  if (args.previousRecap && available > 0) {
+    const previous = args.previousRecap.length > available
+      ? `…${available > 1 ? args.previousRecap.slice(-(available - 1)) : ""}` : args.previousRecap
+    blocks.push("PREVIOUS RECAP — context from earlier session history:\n" + previous)
   }
   if (args.truncated) {
     blocks.push(

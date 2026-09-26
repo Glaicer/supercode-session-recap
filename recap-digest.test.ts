@@ -103,9 +103,9 @@ describe("buildRecapDigest — file edits", () => {
       "+alpha3",
       " context",
     ].join("\n")
-    const built = buildRecapDigest([
-      msg("m1", "assistant", [toolCompleted("edit", { filePath: "src/a.ts" }, { diff })]),
-    ])
+    const built = buildRecapDigest([{ id: "m1", type: "assistant", content: [{
+      type: "tool", name: "edit", state: { status: "completed", input: { path: "src/a.ts" }, metadata: { diff } },
+    }] }])
     assert.ok(built.digest.includes("src/a.ts"), built.digest)
     assert.ok(built.digest.includes("+3 -2"), built.digest)
     assert.ok(!built.digest.includes("ALPHA-LINE"), "diff content leaked")
@@ -277,6 +277,19 @@ describe("buildRecapRequest", () => {
     assert.ok(prompt.includes("PREVIOUS RECAP"))
     assert.ok(prompt.includes("**Working on:** earlier thread"))
     assert.ok(prompt.indexOf("PREVIOUS RECAP") < prompt.indexOf("SESSION DIGEST:"))
+  })
+  it("bounds oversized previous context while retaining its latest material", () => {
+    const prompt = buildRecapRequest({
+      digest: "user: new work".padEnd(80, "."),
+      previousRecap: `EARLIER-${"x".repeat(200)}-LATEST`,
+      budget: 100,
+    })
+    const previous = prompt.split("PREVIOUS RECAP — context from earlier session history:\n")[1]
+      .split("\n\nSESSION DIGEST:")[0]
+    assert.ok(previous.startsWith("…"), previous)
+    assert.ok(previous.endsWith("-LATEST"), previous)
+    assert.ok(!previous.includes("EARLIER"))
+    assert.ok(previous.length + 80 <= 100)
   })
   it("marks truncation in the prompt with an explicit line when it happened", () => {
     const withMark = buildRecapRequest({ digest: "d", truncated: true })

@@ -24,14 +24,16 @@ export default Plugin.define({
         try {
           await context.data.session.message.sync(sessionID)
           const previous = state()[sessionID]
+          const budget = Math.max(1, Math.floor(options.budget))
+          const reserved = previous?.text ? Math.min(previous.text.length, Math.floor(budget / 4)) : 0
           const { digest, truncated, lastIncludedID } = buildRecapDigest(context.data.session.message.list(sessionID), {
-            budget: options.budget,
+            budget: budget - reserved,
             afterMessageID: previous?.anchor,
           })
           if (!digest || disposed) return
           const location = session.location
           const response = await recap.summarize({ prompt: buildRecapRequest({
-            digest, truncated, previousRecap: previous?.text,
+            digest, truncated, previousRecap: previous?.text, budget,
           }) }, { location }) as {
             text: string
             warnings: Array<{ source: string; message: string }>
