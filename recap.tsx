@@ -18,7 +18,6 @@ const errorText = (error: unknown): string => {
 type RecapTheme = {
   readonly text: { readonly base: RGBA; readonly muted: RGBA }
   readonly markdown: {
-    readonly text: RGBA
     readonly heading: RGBA
     readonly strong: RGBA
     readonly emphasis: RGBA
@@ -31,7 +30,9 @@ type RecapTheme = {
 }
 
 const syntaxStyleFor = (theme: RecapTheme) => SyntaxStyle.fromStyles({
-  "default": { fg: theme.markdown.text },
+  // Body text follows the sidebar's muted secondary text; accent tokens keep
+  // their theme colors.
+  "default": { fg: theme.text.muted },
   "conceal": { fg: theme.text.muted },
   "markup.heading": { fg: theme.markdown.heading, bold: true },
   "markup.strong": { fg: theme.markdown.strong, bold: true },
@@ -197,7 +198,10 @@ export default Plugin.define({
     })
 
     const removeSlot = context.ui.slot({
-      append: "sidebar.content",
+      // `after`, not `append`: a replace takeover of this path (e.g. a
+      // sidebar plugin's hideMcp mode) suppresses every append/prepend claim
+      // targeting the boundary. Sibling placements stay outside it.
+      after: "sidebar.content",
       render: ({ sessionID }) => {
         let current: SyntaxStyle | undefined
         // A theme switch swaps the style; the old one is released once the
@@ -235,7 +239,7 @@ export default Plugin.define({
                   content={recapOf(sessionID)?.text ?? ""}
                   conceal={true}
                   internalBlockMode="top-level"
-                  fg={context.theme.markdown.text}
+                  fg={context.theme.text.muted}
                 />
               </Show>
               <Show when={isGenerating(sessionID)}>
