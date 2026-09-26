@@ -13,7 +13,7 @@ Once the V2 release is published, install from npm by referencing the package na
 }
 ```
 
-The V2 build (0.2.0) has not been published yet; the current npm release (0.1.0) is V1-only, do not install it for V2. Until the V2 release is published, pack this checkout, install the tarball into an isolated directory and reference that installed directory instead:
+The V2 build (1.0.0) has not been published yet; the current npm release (0.1.0) is V1-only, do not install it for V2. Until the V2 release is published, pack this checkout, install the tarball into an isolated directory and reference that installed directory instead:
 
 ```jsonc
 {

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@glaicer/supercode-session-recap",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "OpenCode V2 plugin that shows a short Recap of a completed root session in the TUI sidebar without writing it to History.",
   "type": "module",
   "license": "MIT",
