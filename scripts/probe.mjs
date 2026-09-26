@@ -14,41 +14,68 @@ const probeRoot = join(tmpdir(), "opencode")
 await mkdir(probeRoot, { recursive: true })
 const temp = await mkdtemp(join(probeRoot, "recap-v2-probe-"))
 const project = join(temp, "project")
+const noPlugin = join(temp, "no-plugin")
 const config = join(temp, "config")
 const requests = []
+const sleep = (ms) => new Promise((ok) => setTimeout(ok, ms))
+const digestRequests = () => requests.filter((request) => JSON.stringify(request).includes("SESSION DIGEST:"))
 let toolCalls = 0
+let digestCount = 0
 const mock = createServer(async (req, res) => {
+  // A timed-out or aborted generation leaves nobody to answer: writes to the
+  // destroyed socket must stay silent so later mock phases keep working.
+  res.on("error", () => {})
   let body = ""
   for await (const chunk of req) body += chunk
   const input = JSON.parse(body)
   requests.push(input)
   const prompt = JSON.stringify(input)
-  const toolDigest = prompt.includes("[tool] read")
-  const text = prompt.includes("SESSION DIGEST:")
-    ? toolDigest ? "Tool work recap." : "Recap from project model."
-    : "The sidebar is fixed."
-  res.setHeader("content-type", "text/event-stream")
   const event = (delta, finish_reason = null) => ({ id: "mock", object: "chat.completion.chunk", created: 1,
     model: input.model, choices: [{ index: 0, delta, finish_reason }] })
-  if (prompt.includes("Use read tool") && !prompt.includes("SESSION DIGEST:") && toolCalls === 0) {
+  const send = (payload) => {
+    try { res.write(payload) } catch { /* the client aborted the request */ }
+  }
+  const end = () => {
+    try { res.end() } catch { /* the client aborted the request */ }
+  }
+  const stream = (text) => {
+    res.setHeader("content-type", "text/event-stream")
+    send(`data: ${JSON.stringify(event({ role: "assistant", content: text }))}\n\n`)
+    send(`data: ${JSON.stringify(event({}, "stop"))}\n\n`)
+    send("data: [DONE]\n\n")
+    end()
+  }
+  if (prompt.includes("SESSION DIGEST:")) {
+    digestCount++
+    // Digests 1 and 2 are slow enough to observe the indicator and outlive the
+    // timeout; digest 5 answers after the live deletion it was started by.
+    if (digestCount === 1) { await sleep(1200); stream("First recap text") }
+    else if (digestCount === 2) { await sleep(4000); stream("Late recap text") }
+    else if (digestCount === 5) { await sleep(3000); stream("Fifth recap text") }
+    else if (prompt.includes("[tool] read")) stream("Tool work recap.")
+    else if (digestCount === 3) stream("Third recap text")
+    else stream(`Recap text ${digestCount}`)
+  } else if (prompt.includes("Use read tool") && toolCalls === 0) {
     toolCalls++
     const names = Array.isArray(input.tools)
       ? input.tools.map((tool) => tool.function?.name ?? tool.name)
       : Object.keys(input.tools ?? {})
     const name = names.find((key) => key === "read" || key.endsWith("_read"))
     assert(name, `Read tool missing from model request: ${names}`)
-    res.write(`data: ${JSON.stringify(event({ tool_calls: [{ index: 0, id: "call_recap_probe", type: "function",
+    res.setHeader("content-type", "text/event-stream")
+    send(`data: ${JSON.stringify(event({ tool_calls: [{ index: 0, id: "call_recap_probe", type: "function",
       function: { name, arguments: JSON.stringify({ path: "README.md" }) } }] }))}\n\n`)
-    res.write(`data: ${JSON.stringify(event({}, "tool_calls"))}\n\n`)
+    send(`data: ${JSON.stringify(event({}, "tool_calls"))}\n\n`)
+    send("data: [DONE]\n\n")
+    end()
   } else {
-    res.write(`data: ${JSON.stringify(event({ role: "assistant", content: text }))}\n\n`)
-    res.write(`data: ${JSON.stringify(event({}, "stop"))}\n\n`)
+    stream("The sidebar is fixed.")
   }
-  res.end("data: [DONE]\n\n")
 })
 await new Promise((ok) => mock.listen(0, "127.0.0.1", ok))
 const modelPort = mock.address().port
 await mkdir(project, { recursive: true })
+await mkdir(noPlugin, { recursive: true })
 await writeFile(join(project, "README.md"), "Probe project fixture.\n")
 await mkdir(join(config, "opencode"), { recursive: true })
 const install = join(temp, "install")
@@ -78,7 +105,7 @@ assert.equal(childCalls, 0)
 disposeChild()
 await writeFile(join(project, "opencode.json"), JSON.stringify({
   model: "recap-probe/project-only",
-  plugins: [{ package: installed, options: {} }],
+  plugins: [{ package: installed, options: { timeout_ms: 2000 } }],
   providers: { "recap-probe": { name: "Recap probe", env: ["RECAP_PROBE_KEY"],
     package: "@opencode/ai/providers/openai-compatible",
     settings: { baseURL: `http://127.0.0.1:${modelPort}/v1` },
@@ -101,7 +128,7 @@ try {
   const client = OpenCode.make({ baseUrl: `http://127.0.0.1:${port}`,
     headers: { authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` } })
   for (let i = 0; i < 100; i++) {
-    try { await client.server.info(); break } catch { await new Promise((ok) => setTimeout(ok, 200)) }
+    try { await client.server.info(); break } catch { await sleep(200) }
     if (i === 99) throw new Error(`Server did not start: ${logs}`)
   }
   const location = { directory: project }
@@ -109,17 +136,31 @@ try {
   const output = await client.rpc(Recap).summarize({ prompt: "SESSION DIGEST:\nuser: Fix sidebar" }, { location })
   const plugins = await client.plugin.list({ location })
   assert(plugins.data.some((p) => p.id === "supercode.recap.server"), `${JSON.stringify(plugins)}\n${logs}`)
-  assert.deepEqual(output, { text: "Recap from project model.", warnings: [] })
+  assert.deepEqual(output, { text: "First recap text", warnings: [] })
   assert.equal(requests.length, 1)
   assert.equal(requests[0].model, "project-only")
   assert.equal(requests[0].tools, undefined)
   const after = await client.session.list({ location })
   assert.deepEqual(after.data, before.data)
+  // Reset the controlled endpoint's digest numbering so the PTY phase sees a
+  // known sequence starting at digest 1.
+  requests.length = 0
+  digestCount = 0
+  // A location without the server component must fail loudly instead of
+  // silently generating through some global or default model.
+  const requestsBeforeUnavailable = requests.length
+  await assert.rejects(
+    client.rpc(Recap).summarize({ prompt: "SESSION DIGEST:\nuser: no companion" }, { location: { directory: noPlugin } }),
+    // Host RPC failures arrive as plain { type, message } objects, not Errors.
+    (error) => typeof error?.message === "string" && error.message.includes("RPC is unavailable"),
+  )
+  assert.equal(requests.length, requestsBeforeUnavailable, "an unavailable RPC must not fall back to a model call")
   const session = await client.session.create({ location })
   const tui = spawn("python3", [join(root, "scripts", "probe-pty.py"), "opencode", "--server",
-    `http://127.0.0.1:${port}`, "--session", session.id, project], { cwd: project, env, stdio: ["ignore", "pipe", "pipe"] })
+    `http://127.0.0.1:${port}`, "--session", session.id, project], { cwd: project, env, stdio: ["pipe", "pipe", "pipe"] })
   let screen = ""
   let toolShown = false
+  let historyMessages = 0
   const recordScreen = (bytes) => {
     screen = (screen + bytes).slice(-500_000)
     const start = screen.lastIndexOf("Tool wo")
@@ -128,69 +169,142 @@ try {
   tui.stdout.on("data", recordScreen)
   tui.stderr.on("data", recordScreen)
   const waitFor = async (value) => {
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 150; i++) {
       if (screen.includes(value) || (value === "Tool work recap." && toolShown)) return
       if (tui.exitCode !== null) break
-      await new Promise((ok) => setTimeout(ok, 200))
+      await sleep(200)
     }
     throw new Error(`TUI did not show ${value}: ${screen.slice(-1500)}`)
   }
+  // The renderer emits diffs, so a changed sidebar line only contains its
+  // changed cells. Resizing forces a full repaint: bytes captured after this
+  // point are the whole current frame, which makes both presence and absence
+  // checks meaningful. The value is first located, then captured again from a
+  // single fresh repaint so stale frames cannot satisfy absence checks.
+  const waitForRepaint = async (value) => {
+    const deadline = Date.now() + 60_000
+    let round = 0
+    const capture = async () => {
+      screen = ""
+      tui.stdin.write(`resize ${round++ % 2 ? 50 : 49} 220\n`)
+      for (let i = 0; i < 25 && Date.now() < deadline; i++) {
+        if (screen.includes(value)) return true
+        if (tui.exitCode !== null) return false
+        await sleep(200)
+      }
+      return false
+    }
+    while (Date.now() < deadline) {
+      if (!(await capture())) continue
+      if (!(await capture())) continue
+      // Let the rest of the frame flush before callers assert absence.
+      await sleep(400)
+      return
+    }
+    throw new Error(`TUI never repainted ${value}: ${screen.slice(-1500)}`)
+  }
   try {
     await waitFor("Recap")
+    await client.session.prompt({ sessionID: session.id, text: "Fix the sidebar", location })
+    await waitFor("Generating recap")
+    await waitForRepaint("First recap text")
+    assert(!screen.includes("Generating recap"), "the indicator must clear once the recap is stored")
+    await client.session.prompt({ sessionID: session.id, text: "Second prompt", location })
+    await waitFor("Generating recap")
+    await waitFor("timed out after 2000ms")
+    assert(screen.includes("First recap text"), "a timeout must keep the last successful recap")
+    // Digest 2 answers at 4000ms — past the local timeout — and must be discarded.
+    await sleep(3200)
+    await waitForRepaint("First recap text")
+    assert(!screen.includes("Generating recap"), "the indicator must clear on timeout")
+    assert(!screen.includes("Late recap text"), "a late answer after the local timeout must never be shown")
+    await client.session.prompt({ sessionID: session.id, text: "Third prompt", location })
+    for (let i = 0; i < 25 && digestRequests().length < 3; i++) await sleep(200)
+    await waitForRepaint("Third recap text")
     const transferred = await client.session.export({ sessionID: session.id, location })
+    // Import inserts message IDs verbatim, so reusing the parent's settled
+    // history collides with its rows; the child only needs to exist and run.
     const child = await client.session.import({
-      ...transferred,
       info: { ...transferred.info, id: `ses_${randomBytes(12).toString("hex")}`, parentID: session.id },
+      messages: [],
       location,
     })
     await client.session.prompt({ sessionID: child.id, text: "Inspect the child session", location })
     await client.session.wait({ sessionID: child.id, location })
-    await new Promise((ok) => setTimeout(ok, 500))
-    assert.equal(requests.filter((request) => JSON.stringify(request).includes("SESSION DIGEST:")).length, 1)
-    await client.session.prompt({ sessionID: session.id, text: "Fix the sidebar", location })
-    await waitFor("Recap from project model.")
-    const history = await client.session.context({ sessionID: session.id, location })
-    assert(history.some((message) => message.type === "assistant" && message.content.some((p) => p.type === "text" && p.text === "The sidebar is fixed.")))
-    assert(!history.some((message) => message.type === "assistant" && message.content.some((p) => p.type === "text" && p.text === "Recap from project model.")))
-    assert.equal((await client.session.list({ location })).data.length, 2)
-    const recaps = requests.filter((request) => JSON.stringify(request).includes("SESSION DIGEST:"))
-    assert.equal(recaps.length, 2)
-    assert(recaps.every((request) => request.tools === undefined))
-    assert.equal(recaps.at(-1).model, "project-only")
-    assert(JSON.stringify(recaps.at(-1)).includes("user: Fix the sidebar"))
-    assert(JSON.stringify(recaps.at(-1)).includes("assistant: The sidebar is fixed."))
+    await sleep(500)
+    assert.equal(digestRequests().length, 3, "child execution must not trigger a digest")
     await client.session.prompt({ sessionID: session.id, text: "Use read tool to inspect README.md", location })
     await client.session.wait({ sessionID: session.id, location })
     const toolHistoryLive = await client.session.context({ sessionID: session.id, location })
     assert(toolHistoryLive.some((message) => message.type === "assistant" && message.content.some(
       (part) => part.type === "tool" && part.name === "read" && part.state.status === "completed",
     )), JSON.stringify(toolHistoryLive.slice(-3)).slice(-3000))
-    for (let i = 0; i < 50 && requests.filter((request) => JSON.stringify(request).includes("SESSION DIGEST:")).length < 3; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 200))
-    }
-    const liveToolRecap = requests.filter((request) => JSON.stringify(request).includes("SESSION DIGEST:")).at(-1)
+    for (let i = 0; i < 50 && digestRequests().length < 4; i++) await sleep(200)
+    const liveToolRecap = digestRequests().at(-1)
     assert(JSON.stringify(liveToolRecap).includes("[tool] read"), JSON.stringify({
-      count: requests.filter((request) => JSON.stringify(request).includes("SESSION DIGEST:")).length,
+      count: digestRequests().length,
       last: JSON.stringify(liveToolRecap).slice(-1800),
     }))
-    await waitFor("Tool work recap.")
+    await waitForRepaint("Tool work recap.")
     assert.equal(toolCalls, 1)
-    const toolHistory = [
-      { id: "m1", type: "user", text: "Check the tests" },
-      { id: "m2", type: "assistant", content: [{ type: "tool", name: "bash", state: {
-        status: "completed", input: { command: "npm test" }, content: [{ type: "text", text: "47 tests passed\nlarge private output" }],
-      } }], snapshot: { files: ["src/app.ts"] } },
-    ]
-    let completed
-    let empty = false
-    let fail = false
-    let calls = 0
-    const toasts = []
-    let onDigestSuccess
-    let onDeleted
-    const stopDigest = tuiPlugin.setup({
-      options: { budget: 160 },
-      client: { rpc: () => ({ summarize: async (input, options) => {
+    const history = await client.session.context({ sessionID: session.id, location })
+    historyMessages = history.length
+    assert(history.some((message) => message.type === "assistant" && message.content.some((p) => p.type === "text" && p.text === "The sidebar is fixed.")))
+    const recapTexts = ["First recap text", "Late recap text", "Third recap text", "Tool work recap."]
+    assert(!history.some((message) => message.type === "assistant" && message.content.some(
+      (p) => p.type === "text" && recapTexts.includes(p.text),
+    )), "no Recap text may enter History")
+    assert.equal((await client.session.list({ location })).data.length, 2)
+    const recaps = digestRequests()
+    assert.equal(recaps.length, 4)
+    assert(recaps.every((request) => request.tools === undefined))
+    assert(recaps.every((request) => request.model === "project-only"))
+    const first = JSON.stringify(recaps[0])
+    assert(!first.includes("PREVIOUS RECAP"), first)
+    const timedOut = JSON.stringify(recaps[1])
+    assert(timedOut.includes("PREVIOUS RECAP"), timedOut)
+    assert(timedOut.includes("First recap text"), timedOut)
+    const third = JSON.stringify(recaps[2])
+    assert(third.includes("PREVIOUS RECAP"), third)
+    assert(third.includes("First recap text"), third)
+    assert(third.includes("Second prompt"), "the timed-out window must stay in the next digest")
+    assert(third.includes("Third prompt"), third)
+    const toolRecap = JSON.stringify(recaps[3])
+    assert(toolRecap.includes("[tool] read"), toolRecap)
+    // In-flight deletion through the live host: the release must not wait for
+    // the timeout, the late answer must be discarded and no failure reported.
+    const deletionDigest = digestRequests().length + 1
+    await client.session.prompt({ sessionID: session.id, text: "Delete me mid-flight", location })
+    for (let i = 0; i < 25 && digestRequests().length < deletionDigest; i++) await sleep(200)
+    assert.equal(digestRequests().length, deletionDigest, "the deletion prompt must start a digest")
+    screen = ""
+    await client.session.remove({ sessionID: session.id, location })
+    // Digest 5 answers at 3000ms, after the deletion.
+    await sleep(3500)
+    assert(!screen.includes("Fifth recap text"), "a deleted session's late answer must not surface")
+    assert(!screen.includes("timed out"), "deleting a session must release the wait without a timeout toast")
+  } finally {
+    tui.kill()
+  }
+  const toolHistory = [
+    { id: "m1", type: "user", text: "Check the tests" },
+    { id: "m2", type: "assistant", content: [{ type: "tool", name: "bash", state: {
+      status: "completed", input: { command: "npm test" }, content: [{ type: "text", text: "47 tests passed\nlarge private output" }],
+    } }], snapshot: { files: ["src/app.ts"] } },
+  ]
+  let completed
+  let empty = false
+  let fail = false
+  let calls = 0
+  const toasts = []
+  let onDigestSuccess
+  let onDeleted
+  const stopDigest = tuiPlugin.setup({
+    options: { budget: 160 },
+    client: { rpc: () => ({
+      // Older servers may not answer settings; the local budget must then apply.
+      settings: async () => { throw new Error("settings unavailable") },
+      summarize: async (input, options) => {
         calls++
         try {
           if (fail) throw new Error("temporary generation failure")
@@ -198,117 +312,273 @@ try {
           const response = await client.rpc(Recap).summarize(input, options)
           return calls === 1 ? { ...response, text: `${response.text} ${"x".repeat(300)} LAST-CONTEXT` } : response
         } finally { completed() }
-      } }) },
+      },
+    }) },
+    data: {
+      on: (type, handler) => {
+        if (type === "session.execution.succeeded") onDigestSuccess = handler
+        if (type === "session.deleted") onDeleted = handler
+        return () => {}
+      },
+      session: {
+        get: () => ({ id: session.id, location }),
+        message: { sync: async () => {}, list: () => toolHistory },
+      },
+    },
+    ui: { slot: () => () => {}, toast: { show: (toast) => toasts.push(toast) } },
+  })
+  const triggerDigest = async (expectsCall = true) => {
+    const done = expectsCall
+      ? Promise.race([
+        new Promise((resolve) => { completed = resolve }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("Recap RPC was not called")), 5000)),
+      ])
+      : sleep(50)
+    onDigestSuccess({ data: { sessionID: session.id } })
+    await done
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  try {
+    await triggerDigest()
+    const toolRequest = JSON.stringify(requests.at(-1))
+    assert(toolRequest.includes("[tool] bash npm test -> ok: 47 tests passed"), toolRequest)
+    assert(toolRequest.includes("[file] src/app.ts"), toolRequest)
+    assert(!toolRequest.includes("large private output"), toolRequest)
+    assert(!toolRequest.includes("PREVIOUS RECAP"), toolRequest)
+    await triggerDigest(false)
+    assert.equal(calls, 1, "empty incremental window must not call the model")
+    toolHistory.push({ id: "m3", type: "user", text: "New task" })
+    empty = true
+    await triggerDigest()
+    assert.equal(calls, 2)
+    assert(toasts.some((toast) => toast.variant === "error" && toast.message.includes("empty response")))
+    empty = false
+    fail = true
+    await triggerDigest()
+    assert.equal(calls, 3)
+    fail = false
+    await triggerDigest()
+    assert.equal(calls, 4)
+    const retryRequest = JSON.stringify(requests.at(-1))
+    assert(retryRequest.includes("New task"), retryRequest)
+    assert(retryRequest.includes("PREVIOUS RECAP"), retryRequest)
+    assert(retryRequest.includes("LAST-CONTEXT"), retryRequest)
+    assert(retryRequest.includes("…"), retryRequest)
+    assert(!retryRequest.includes("Recap text"), retryRequest)
+    assert(!retryRequest.includes("Check the tests"), retryRequest)
+    assert(!retryRequest.includes("[tool] bash"), retryRequest)
+    onDeleted({ data: { sessionID: session.id } })
+    toolHistory.push({ id: "m4", type: "user", text: "Follow-up" })
+    await triggerDigest()
+    assert.equal(calls, 5)
+    const clearedRequest = JSON.stringify(requests.at(-1))
+    assert(clearedRequest.includes("Check the tests"), clearedRequest)
+    assert(clearedRequest.includes("Follow-up"), clearedRequest)
+    assert(!clearedRequest.includes("PREVIOUS RECAP"), clearedRequest)
+    assert(!clearedRequest.includes("LAST-CONTEXT"), clearedRequest)
+  } finally { stopDigest() }
+  // --- lifecycle: re-entry, per-session isolation, RPC loss, deletion, unload ---
+  const settle = async () => {
+    for (let i = 0; i < 3; i++) await new Promise((resolve) => setImmediate(resolve))
+  }
+  const makeLifecycleHarness = (settingsImpl) => {
+    const state = {
+      toasts: [], calls: [], stops: { success: 0, deleted: 0, slot: 0 },
+      settingsCalls: 0, settingsLocations: [], settingsOptions: undefined,
+      sessions: new Map(), histories: new Map(), onSuccess: undefined, onDeleted: undefined,
+      failNext: undefined, render: undefined,
+    }
+    const dispose = tuiPlugin.setup({
+      // Local values are deliberately hostile: the server's settings, bound to
+      // the generation timeout, must win over them.
+      options: { budget: 1, timeout_ms: 500 },
+      client: { rpc: () => ({
+        settings: settingsImpl ?? (async (_input, rpcOptions) => {
+          state.settingsCalls += 1
+          state.settingsLocations.push(rpcOptions?.location?.directory)
+          state.settingsOptions = rpcOptions
+          return { budget: 1000, timeout_ms: 5000 }
+        }),
+        summarize: (input, rpcOptions) => new Promise((resolve, reject) => {
+          if (state.failNext) {
+            const message = state.failNext
+            state.failNext = undefined
+            reject({ type: "rpc.unavailable", message })
+            return
+          }
+          state.calls.push({ prompt: input.prompt, rpcOptions, resolve, reject })
+        }),
+      }) },
       data: {
         on: (type, handler) => {
-          if (type === "session.execution.succeeded") onDigestSuccess = handler
-          if (type === "session.deleted") onDeleted = handler
-          return () => {}
+          if (type === "session.execution.succeeded") state.onSuccess = handler
+          if (type === "session.deleted") state.onDeleted = handler
+          return () => {
+            if (type === "session.execution.succeeded") state.stops.success += 1
+            if (type === "session.deleted") state.stops.deleted += 1
+          }
         },
         session: {
-          get: () => ({ id: session.id, location }),
-          message: { sync: async () => {}, list: () => toolHistory },
+          get: (id) => state.sessions.get(id),
+          message: { sync: async () => {}, list: (id) => state.histories.get(id) ?? [] },
         },
       },
-      ui: { slot: () => () => {}, toast: { show: (toast) => toasts.push(toast) } },
-    })
-    const triggerDigest = async (expectsCall = true) => {
-      const done = expectsCall
-        ? Promise.race([
-          new Promise((resolve) => { completed = resolve }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("Recap RPC was not called")), 5000)),
-        ])
-        : new Promise((resolve) => setTimeout(resolve, 50))
-      onDigestSuccess({ data: { sessionID: session.id } })
-      await done
-      await new Promise((resolve) => setImmediate(resolve))
-    }
-    try {
-      await triggerDigest()
-      const toolRequest = JSON.stringify(requests.at(-1))
-      assert(toolRequest.includes("[tool] bash npm test -> ok: 47 tests passed"), toolRequest)
-      assert(toolRequest.includes("[file] src/app.ts"), toolRequest)
-      assert(!toolRequest.includes("large private output"), toolRequest)
-      assert(!toolRequest.includes("PREVIOUS RECAP"), toolRequest)
-      await triggerDigest(false)
-      assert.equal(calls, 1, "empty incremental window must not call the model")
-      toolHistory.push({ id: "m3", type: "user", text: "New task" })
-      empty = true
-      await triggerDigest()
-      assert.equal(calls, 2)
-      assert(toasts.some((toast) => toast.variant === "error" && toast.message.includes("empty response")))
-      empty = false
-      fail = true
-      await triggerDigest()
-      assert.equal(calls, 3)
-      fail = false
-      await triggerDigest()
-      assert.equal(calls, 4)
-      const retryRequest = JSON.stringify(requests.at(-1))
-      assert(retryRequest.includes("New task"), retryRequest)
-      assert(retryRequest.includes("PREVIOUS RECAP"), retryRequest)
-      assert(retryRequest.includes("LAST-CONTEXT"), retryRequest)
-      assert(retryRequest.includes("…"), retryRequest)
-      assert(!retryRequest.includes("Recap from project model."), retryRequest)
-      assert(!retryRequest.includes("Check the tests"), retryRequest)
-      assert(!retryRequest.includes("[tool] bash"), retryRequest)
-      onDeleted({ data: { sessionID: session.id } })
-      toolHistory.push({ id: "m4", type: "user", text: "Follow-up" })
-      await triggerDigest()
-      assert.equal(calls, 5)
-      const clearedRequest = JSON.stringify(requests.at(-1))
-      assert(clearedRequest.includes("Check the tests"), clearedRequest)
-      assert(clearedRequest.includes("Follow-up"), clearedRequest)
-      assert(!clearedRequest.includes("PREVIOUS RECAP"), clearedRequest)
-      assert(!clearedRequest.includes("LAST-CONTEXT"), clearedRequest)
-    } finally { stopDigest() }
-    let timeoutCalls = 0
-    let releaseLate
-    let onTimeoutSuccess
-    const timeoutPrompts = []
-    const timeoutToasts = []
-    const disposeTimeout = tuiPlugin.setup({
-      options: { budget: 160, timeout_ms: 150 },
-      client: { rpc: () => ({ summarize: (input) => {
-        timeoutCalls++
-        timeoutPrompts.push(input.prompt)
-        if (timeoutCalls === 1) return new Promise((resolve) => { releaseLate = () => resolve({ text: "late recap", warnings: [] }) })
-        return { text: "Recap after timeout.", warnings: [] }
-      } }) },
-      data: {
-        on: (type, handler) => { if (type === "session.execution.succeeded") onTimeoutSuccess = handler; return () => {} },
-        session: {
-          get: () => ({ id: session.id, location }),
-          message: { sync: async () => {}, list: () => toolHistory },
-        },
+      ui: {
+        slot: (claim) => { state.render = claim.render; return () => { state.stops.slot += 1 } },
+        toast: { show: (toast) => state.toasts.push(toast) },
       },
-      ui: { slot: () => () => {}, toast: { show: (toast) => timeoutToasts.push(toast) } },
     })
-    try {
-      onTimeoutSuccess({ data: { sessionID: session.id } })
-      for (let i = 0; i < 50 && !timeoutToasts.some((toast) => toast.message.includes("timed out")); i++) {
-        await new Promise((resolve) => setTimeout(resolve, 100))
-      }
-      assert(timeoutToasts.some((toast) => toast.variant === "error" && toast.message.includes("timed out")), JSON.stringify(timeoutToasts))
-      assert.equal(timeoutCalls, 1)
-      releaseLate()
-      await new Promise((resolve) => setImmediate(resolve))
-      onTimeoutSuccess({ data: { sessionID: session.id } })
-      for (let i = 0; i < 50 && timeoutCalls < 2; i++) {
-        await new Promise((resolve) => setTimeout(resolve, 100))
-      }
-      assert.equal(timeoutCalls, 2)
-      const afterTimeout = timeoutPrompts.at(-1)
-      assert(afterTimeout.includes("Follow-up"), afterTimeout)
-      assert(!afterTimeout.includes("late recap"), afterTimeout)
-      assert(!afterTimeout.includes("PREVIOUS RECAP"), afterTimeout)
-    } finally { disposeTimeout() }
-    console.log(JSON.stringify({ installed, model: recaps.at(-1).model, text: "Recap from project model.",
-      sessions: 2, childIgnored: true, historyMessages: history.length, providerRequests: requests.length, sidebarUpdated: true,
-      deletionClearedState: true, timeoutEndedLocalWait: true }, null, 2))
-  } finally {
-    tui.kill()
+    return { state, dispose }
   }
+  const lifecycle = makeLifecycleHarness()
+  const a = { id: "root-a", location }
+  const b = { id: "root-b", location: { directory: join(project, "elsewhere") } }
+  lifecycle.state.sessions.set(a.id, a)
+  lifecycle.state.sessions.set(b.id, b)
+  lifecycle.state.histories.set(a.id, [{ id: "a1", type: "user", text: "alpha work" }])
+  lifecycle.state.histories.set(b.id, [{ id: "b1", type: "user", text: "beta work" }])
+  lifecycle.state.onSuccess({ data: { sessionID: a.id } })
+  lifecycle.state.onSuccess({ data: { sessionID: a.id } })
+  await settle()
+  assert.equal(lifecycle.state.calls.length, 1, "a repeated completion during generation must not start a second call")
+  assert(lifecycle.state.calls[0].prompt.includes("alpha work"))
+  assert.equal(lifecycle.state.settingsCalls, 1, "the server settings must be fetched once")
+  assert.deepEqual(lifecycle.state.settingsLocations, [location.directory],
+    "the settings call must be routed to the session's location")
+  assert(lifecycle.state.settingsOptions.signal instanceof AbortSignal, "the settings call must carry an abort signal")
+  await sleep(700)
+  assert(!lifecycle.state.toasts.some((toast) => toast.message.includes("timed out")),
+    "the server timeout_ms must win over the local option")
+  assert.equal(lifecycle.state.calls.length, 1, "the generation must still be waiting on the model")
+  lifecycle.state.onSuccess({ data: { sessionID: b.id } })
+  await settle()
+  assert.equal(lifecycle.state.calls.length, 2, "a second root session must generate in parallel")
+  assert(lifecycle.state.calls[1].prompt.includes("beta work"))
+  assert(!lifecycle.state.calls[1].prompt.includes("alpha work"))
+  assert.deepEqual(lifecycle.state.settingsLocations, [location.directory, b.location.directory],
+    "each location resolves its own settings once")
+  lifecycle.state.calls[1].resolve({ text: "Recap B", warnings: [] })
+  await settle()
+  lifecycle.state.histories.get(b.id).push({ id: "b2", type: "user", text: "beta follow-up" })
+  lifecycle.state.onSuccess({ data: { sessionID: b.id } })
+  await settle()
+  assert.equal(lifecycle.state.calls.length, 3, "one finished session must not block another")
+  const bSecond = lifecycle.state.calls[2]
+  assert(bSecond.prompt.includes("beta follow-up"))
+  assert(bSecond.prompt.includes("PREVIOUS RECAP"))
+  assert(bSecond.prompt.includes("Recap B"))
+  assert(!bSecond.prompt.includes("alpha work"), "a session window must not leak another session's messages")
+  bSecond.resolve({ text: "Recap B2", warnings: [] })
+  await settle()
+  lifecycle.state.calls[0].resolve({ text: "Recap A", warnings: [] })
+  await settle()
+  lifecycle.state.histories.get(a.id).push({ id: "a2", type: "user", text: "alpha follow-up" })
+  lifecycle.state.onSuccess({ data: { sessionID: a.id } })
+  await settle()
+  const aSecond = lifecycle.state.calls[3]
+  assert(aSecond.prompt.includes("Recap A"))
+  assert(!aSecond.prompt.includes("beta work"))
+  aSecond.resolve({ text: "Recap A2", warnings: [] })
+  await settle()
+  // an unavailable RPC reports itself and must not skip the window it failed on
+  lifecycle.state.histories.get(a.id).push({ id: "a3", type: "user", text: "alpha after rpc loss" })
+  lifecycle.state.failNext = "RPC is unavailable: supercode.recap"
+  lifecycle.state.onSuccess({ data: { sessionID: a.id } })
+  await settle()
+  assert(lifecycle.state.toasts.some((toast) => toast.variant === "error" && toast.message.includes("RPC is unavailable")),
+    JSON.stringify(lifecycle.state.toasts))
+  assert.equal(lifecycle.state.calls.length, 4, "an unavailable RPC must not fall back to a model call")
+  lifecycle.state.onSuccess({ data: { sessionID: a.id } })
+  await settle()
+  const aRecovery = lifecycle.state.calls[4]
+  assert(aRecovery.prompt.includes("alpha after rpc loss"), "the failed window must not be skipped")
+  assert(aRecovery.prompt.includes("PREVIOUS RECAP"))
+  assert(aRecovery.prompt.includes("Recap A2"))
+  aRecovery.resolve({ text: "Recap A3", warnings: [] })
+  await settle()
+  // deleting a session mid-generation releases the wait and drops its state
+  const c = { id: "root-c", location }
+  lifecycle.state.sessions.set(c.id, c)
+  lifecycle.state.histories.set(c.id, [{ id: "c1", type: "user", text: "gamma work" }])
+  lifecycle.state.onSuccess({ data: { sessionID: c.id } })
+  await settle()
+  const cFirst = lifecycle.state.calls.at(-1)
+  const toastsBeforeDelete = lifecycle.state.toasts.length
+  lifecycle.state.onDeleted({ data: { sessionID: c.id } })
+  // The host stops serving a deleted session; the plugin must both abort its
+  // local wait and refuse to store what the aborted call later returns.
+  lifecycle.state.sessions.delete(c.id)
+  assert.equal(cFirst.rpcOptions.signal.aborted, true, "deleting a session must release its local wait")
+  cFirst.resolve({ text: "Late gamma", warnings: [] })
+  await settle()
+  assert.equal(lifecycle.state.toasts.length, toastsBeforeDelete, "a deleted session's answer must not be reported")
+  lifecycle.state.sessions.set(c.id, c)
+  lifecycle.state.histories.get(c.id).push({ id: "c2", type: "user", text: "gamma restart" })
+  lifecycle.state.onSuccess({ data: { sessionID: c.id } })
+  await settle()
+  const cSecond = lifecycle.state.calls.at(-1)
+  assert(cSecond.prompt.includes("gamma work"), "deleting a session must drop its anchor")
+  assert(cSecond.prompt.includes("gamma restart"))
+  assert(!cSecond.prompt.includes("PREVIOUS RECAP"), "deleting a session must drop its last successful recap")
+  assert(!cSecond.prompt.includes("Late gamma"), "an aborted call's late answer must not become state")
+  cSecond.resolve({ text: "Recap C", warnings: [] })
+  await settle()
+  // unloading releases subscriptions and the slot, and a late answer from the
+  // old generation must not appear as state of the next one
+  lifecycle.state.histories.get(a.id).push({ id: "a4", type: "user", text: "alpha before unload" })
+  lifecycle.state.onSuccess({ data: { sessionID: a.id } })
+  await settle()
+  const aUnloaded = lifecycle.state.calls.at(-1)
+  const reloaded = makeLifecycleHarness()
+  reloaded.state.sessions.set(a.id, a)
+  reloaded.state.histories.set(a.id, [{ id: "r1", type: "user", text: "fresh after reload" }])
+  lifecycle.dispose()
+  assert.equal(aUnloaded.rpcOptions.signal.aborted, true, "unloading must release the local wait")
+  assert.deepEqual(lifecycle.state.stops, { success: 1, deleted: 1, slot: 1 },
+    "unloading must release every subscription and the slot registration")
+  const toastsAtUnload = lifecycle.state.toasts.length
+  aUnloaded.resolve({ text: "Late reload text", warnings: [] })
+  await settle()
+  assert.equal(lifecycle.state.toasts.length, toastsAtUnload, "a disposed generation must stay silent")
+  reloaded.state.onSuccess({ data: { sessionID: a.id } })
+  await settle()
+  const fresh = reloaded.state.calls[0]
+  assert(fresh.prompt.includes("fresh after reload"))
+  assert(!fresh.prompt.includes("PREVIOUS RECAP"), "a new generation must start with empty state")
+  assert(!fresh.prompt.includes("Late reload text"), "the old generation must not write into the new one")
+  fresh.resolve({ text: "Recap fresh", warnings: [] })
+  await settle()
+  reloaded.dispose()
+  assert.equal(lifecycle.state.settingsCalls, 2, "server settings stay cached per location")
+  // a settings fetch that never answers must end the local wait and retry later
+  let hungSettings = 0
+  const hung = makeLifecycleHarness((_input, rpcOptions) => {
+    hungSettings += 1
+    if (hungSettings > 1) return Promise.resolve({ budget: 1000, timeout_ms: 5000 })
+    return new Promise((_, reject) => {
+      rpcOptions.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true })
+    })
+  })
+  hung.state.sessions.set(a.id, a)
+  hung.state.histories.set(a.id, [{ id: "h1", type: "user", text: "hung settings" }])
+  hung.state.onSuccess({ data: { sessionID: a.id } })
+  await sleep(700)
+  assert(hung.state.toasts.some((toast) => toast.message.includes("timed out")),
+    "a hung settings fetch must end the local wait")
+  assert.equal(hung.state.calls.length, 0, "a hung settings fetch must never reach the model")
+  hung.state.onSuccess({ data: { sessionID: a.id } })
+  await settle()
+  assert.equal(hung.state.calls.length, 1, "a failed settings fetch must be retried")
+  hung.state.calls[0].resolve({ text: "Recap after hung settings", warnings: [] })
+  await settle()
+  hung.dispose()
+  console.log(JSON.stringify({ installed, model: digestRequests().at(-1).model, sidebarText: "Tool work recap.",
+    sessions: 2, childIgnored: true, historyMessages, providerRequests: requests.length, sidebarUpdated: true,
+    indicatorClearedOnSuccess: true, indicatorClearedOnTimeout: true, timedOutWindowRetried: true, lateAnswerDiscarded: true,
+    liveDeletionReleasedWait: true, unavailableRpcRejected: true, deletionClearedState: true, timeoutEndedLocalWait: true,
+    reentrySingleGeneration: true, sessionIsolation: true, settingsLocationRouted: true, settingsCachePerLocation: true,
+    rpcUnavailableFeedback: true, deletedSessionLateAnswerSilent: true, unloadReleasedRegistrations: true,
+    unloadAbortedWait: true, newGenerationStateClean: true, hungSettingsBounded: true }, null, 2))
 } catch (error) {
   console.error(logs.slice(-3000))
   throw error

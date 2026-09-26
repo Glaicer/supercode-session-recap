@@ -12,6 +12,13 @@ export default Plugin.define({
   async setup(ctx) {
     const options = parseRecapOptions(ctx.options)
     await ctx.rpc.register(Recap, {
+      // The TUI component is discovered through the server inventory without the
+      // package entry's options, so the server answers with its own resolved
+      // budget/timeout for the TUI to follow.
+      settings: async () => ({
+        budget: options.budget,
+        timeout_ms: options.timeout_ms,
+      }),
       summarize: async (input, context) => {
         const [models, agents, selected] = await Promise.all([
           ctx.model.list(), ctx.agent.list(), ctx.model.default(),
